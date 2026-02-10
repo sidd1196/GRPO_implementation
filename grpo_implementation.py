@@ -176,7 +176,45 @@ def compute_deltas(rewards: torch.Tensor, mode: str) -> torch.Tensor:
     raise ValueError(f"Unknown mode: {mode}")
 
 
-def compute_loss(log_probs: torch.Tensor, deltas: torch.Tensor, mode: str, old_log_probs: torch.Tensor | None = None) -> torch.Tensor:
+def compute_loss(log_probs: torch.Tensor, deltas: torch.Tensor, mode: str, old_log_probs: torch.Tensor | None = None, rewards_per_step: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Compute policy gradient loss with support for token-level advantages.
+    
+    Args:
+        log_probs: Log probabilities of tokens [batch trial pos] or [batch trial steps pos] for multi-turn
+        deltas: Advantage estimates [batch trial] or [batch trial steps] for multi-turn
+        mode: Loss computation mode ("naive", "unclipped", "clipped")
+        old_log_probs: Old log probabilities for importance sampling [batch trial pos] or [batch trial steps pos]
+        rewards_per_step: Per-step rewards for token-level advantage [batch trial steps]
+                         If provided, assigns step-specific rewards to tokens in that step
+    
+    Returns:
+        Scalar loss tensor
+    """
+    # Handle multi-turn case with token-level advantages
+    if rewards_per_step is not None:
+        # rewards_per_step: [batch trial steps]
+        # log_probs: [batch trial steps pos]
+        # Assign step reward to all tokens in that step
+        step_rewards_expanded = repeat(rewards_per_step, "batch trial steps -> batch trial steps pos", pos=log_probs.shape[-1])
+        
+        if mode == "naive":
+            return -einsum(log_probs, step_rewards_expanded, "batch trial steps pos, batch trial steps pos -> batch trial steps pos").mean()
+        
+        if mode == "unclipped":
+            ratios = torch.exp(log_probs - old_log_probs)  # [batch trial steps pos]
+            return -einsum(ratios, step_rewards_expanded, "batch trial steps pos, batch trial steps pos -> batch trial steps pos").mean()
+        
+        if mode == "clipped":
+            epsilon = 0.01
+            unclipped_ratios = torch.exp(log_probs - old_log_probs)  # [batch trial steps pos]
+            unclipped = einsum(unclipped_ratios, step_rewards_expanded, "batch trial steps pos, batch trial steps pos -> batch trial steps pos")
+            
+            clipped_ratios = torch.clamp(unclipped_ratios, min=1 - epsilon, max=1 + epsilon)
+            clipped = einsum(clipped_ratios, step_rewards_expanded, "batch trial steps pos, batch trial steps pos -> batch trial steps pos")
+            return -torch.minimum(unclipped, clipped).mean()
+    
+    # Original single-turn case
     if mode == "naive":
         return -einsum(log_probs, deltas, "batch trial pos, batch trial -> batch trial pos").mean()
 
@@ -199,12 +237,147 @@ def compute_loss(log_probs: torch.Tensor, deltas: torch.Tensor, mode: str, old_l
 def compute_kl_penalty(log_probs: torch.Tensor, ref_log_probs: torch.Tensor) -> torch.Tensor:
     """
     Compute an estimate of KL(model | ref_model), where the models are given by:
-    log_probs [batch trial pos]
-    ref_log_probs [batch trial pos]
+    log_probs [batch trial pos] or [batch trial steps pos] for multi-turn
+    ref_log_probs [batch trial pos] or [batch trial steps pos] for multi-turn
     Use the estimate:
     KL(p || q) = E_p[q/p - log(q/p) - 1]
     """
     return (torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1).sum(dim=-1).mean()
+
+
+class GroupRelativePolicyOptimization:
+    """
+    Group Relative Policy Optimization for multi-turn code generation.
+    
+    This class supports multi-turn generation where each turn represents a Git commit.
+    It implements token-level advantage assignment, where rewards from each commit step
+    are assigned to the tokens generated in that specific step.
+    """
+    
+    def __init__(self, model: Model, num_turns: int = 5, num_responses: int = 10, device: str = "cpu"):
+        """
+        Initialize GRPO trainer for multi-turn generation.
+        
+        Args:
+            model: The policy model to train
+            num_turns: Number of turns (commits) per trajectory
+            num_responses: Number of response trajectories per prompt
+            device: Device to run on
+        """
+        self.model = model
+        self.num_turns = num_turns
+        self.num_responses = num_responses
+        self.device = device
+    
+    def generate_multi_turn_responses(self, prompts: torch.Tensor) -> torch.Tensor:
+        """
+        Generate multi-turn responses where each turn represents a commit.
+        
+        Args:
+            prompts: Initial prompts [batch pos]
+        
+        Returns:
+            Multi-turn responses [batch trial steps pos]
+        """
+        batch_size = prompts.shape[0]
+        current_state = prompts  # [batch pos]
+        
+        # Store responses for each turn
+        all_responses = []
+        
+        for turn in range(self.num_turns):
+            # Generate responses for current state
+            turn_responses = generate_responses(prompts=current_state, model=self.model, num_responses=self.num_responses)
+            # turn_responses: [batch trial pos]
+            
+            # For simplicity, use the first response as the new state
+            # In practice, this would be the result of applying the commit
+            current_state = turn_responses[:, 0, :]  # [batch pos]
+            
+            all_responses.append(turn_responses)
+        
+        # Stack turns: [batch trial steps pos]
+        multi_turn_responses = torch.stack(all_responses, dim=2)
+        return multi_turn_responses
+    
+    def compute_token_level_advantages(self, rewards_per_step: torch.Tensor) -> torch.Tensor:
+        """
+        Compute token-level advantages from step rewards.
+        
+        Args:
+            rewards_per_step: Rewards for each step [batch trial steps]
+        
+        Returns:
+            Token-level advantages [batch trial steps pos]
+            Each token in step s gets the reward for that step
+        """
+        # Expand step rewards to token level
+        # rewards_per_step: [batch trial steps]
+        # We'll expand this when computing loss, but return step rewards here
+        return rewards_per_step
+    
+    def train_step(self, prompts: torch.Tensor, rewards_per_step: torch.Tensor, 
+                   optimizer: torch.optim.Optimizer, loss_mode: str = "naive") -> torch.Tensor:
+        """
+        Perform one training step with multi-turn generation.
+        
+        Args:
+            prompts: Initial prompts [batch pos]
+            rewards_per_step: Rewards for each step [batch trial steps]
+            optimizer: Optimizer for model parameters
+            loss_mode: Loss computation mode
+        
+        Returns:
+            Loss value
+        """
+        # Generate multi-turn responses
+        multi_turn_responses = self.generate_multi_turn_responses(prompts)  # [batch trial steps pos]
+        
+        # Compute log probabilities for all turns
+        batch_size = prompts.shape[0]
+        log_probs_list = []
+        
+        for step in range(self.num_turns):
+            # Get state for this step (simplified: use previous step's first response)
+            if step == 0:
+                step_prompts = prompts
+            else:
+                step_prompts = multi_turn_responses[:, 0, step-1, :]  # [batch pos]
+            
+            step_responses = multi_turn_responses[:, :, step, :]  # [batch trial pos]
+            step_log_probs = compute_log_probs(step_prompts, step_responses, self.model)  # [batch trial pos]
+            log_probs_list.append(step_log_probs)
+        
+        # Stack log probs: [batch trial steps pos]
+        log_probs = torch.stack(log_probs_list, dim=2)
+        
+        # Compute old log probs for importance sampling
+        with torch.no_grad():
+            old_log_probs_list = []
+            for step in range(self.num_turns):
+                if step == 0:
+                    step_prompts = prompts
+                else:
+                    step_prompts = multi_turn_responses[:, 0, step-1, :]
+                step_responses = multi_turn_responses[:, :, step, :]
+                step_old_log_probs = compute_log_probs(step_prompts, step_responses, self.model)
+                old_log_probs_list.append(step_old_log_probs)
+            old_log_probs = torch.stack(old_log_probs_list, dim=2)
+        
+        # Compute deltas (advantages) for each step
+        step_deltas = compute_deltas(rewards_per_step.view(-1, self.num_turns), mode="centered_rewards")
+        step_deltas = step_deltas.view(batch_size, self.num_responses, self.num_turns)
+        
+        # Compute loss with token-level advantages
+        loss = compute_loss(log_probs=log_probs, deltas=step_deltas, mode=loss_mode, 
+                           old_log_probs=old_log_probs, rewards_per_step=rewards_per_step)
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        return loss
 
 
 def run_policy_gradient(num_epochs: int = 100,
