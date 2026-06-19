@@ -1,0 +1,53 @@
+# MicroCoder-GRPO — three code-specific stability fixes layered onto GRPO.
+# Trains from the SAME base checkpoint as grpo_baseline.yaml; only the marked
+# fields differ, so any delta is attributable to the fixes.
+
+run_name: microcoder-grpo
+model: Qwen/Qwen2.5-Coder-1.5B-Instruct
+
+data:
+  n_train: 374
+  n_heldout: 100
+  seed: 0
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+grpo:
+  output_dir: outputs/microcoder-grpo
+  num_generations: 8
+  max_prompt_length: 512
+  max_completion_length: 1024
+  temperature: 0.7              # Fix 2 stage-1 temperature (callback raises it later)
+  learning_rate: 1.0e-6
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 1
+  num_iterations: 1
+  max_steps: 300
+  # --- Fix 3: no KL + asymmetric (high) clipping, DAPO-style objective ---
+  loss_type: dapo
+  beta: 0.0                     # KL term removed
+  epsilon: 0.2                  # epsilon_low
+  epsilon_high: 0.5             # raised upper clip -> larger updates, more diversity
+  scale_rewards: false          # Dr.GRPO-style: avoid question-difficulty bias
+  # --- Fix 1: truncation masking (don't penalise completions cut off at max len) ---
+  mask_truncated_completions: true
+  # --- rollouts ---
+  use_vllm: true
+  vllm_mode: colocate
+  vllm_gpu_memory_utilization: 0.3
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 1
+  save_steps: 150
+  report_to: wandb
+
+# Fix 2: diversity-determined temperature, implemented as a two-stage schedule.
+two_stage_temperature:
+  enabled: true
+  switch_step: 150
+  temp_stage1: 0.7
+  temp_stage2: 1.0

@@ -1,0 +1,47 @@
+# Standard GRPO baseline — no code-specific fixes.
+# This is the control run that the MicroCoder-GRPO config is compared against.
+
+run_name: grpo-baseline
+model: Qwen/Qwen2.5-Coder-1.5B-Instruct
+
+data:
+  n_train: 374
+  n_heldout: 100
+  seed: 0
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+grpo:
+  output_dir: outputs/grpo-baseline
+  num_generations: 8            # G — completions per prompt
+  max_prompt_length: 512
+  max_completion_length: 1024
+  temperature: 0.8
+  learning_rate: 1.0e-6
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 1
+  num_iterations: 1             # mu — policy updates per generation batch
+  max_steps: 300
+  # --- baseline GRPO objective ---
+  loss_type: grpo
+  beta: 0.04                    # KL coefficient (baseline keeps the KL anchor)
+  epsilon: 0.2                  # symmetric clipping
+  scale_rewards: true
+  mask_truncated_completions: false
+  # --- rollouts ---
+  use_vllm: true
+  vllm_mode: colocate           # single-GPU friendly (Colab A100)
+  vllm_gpu_memory_utilization: 0.3
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 1
+  save_steps: 150
+  report_to: wandb
+
+# Temperature schedule is disabled for the baseline.
+two_stage_temperature:
+  enabled: false

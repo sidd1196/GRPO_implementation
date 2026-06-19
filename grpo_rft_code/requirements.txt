@@ -1,0 +1,12 @@
+# Production post-training stack — pinned for reproducibility.
+# Versions known-good as of mid-2026; bump together if you upgrade TRL.
+trl==0.21.0
+transformers==4.55.0
+peft==0.14.0
+accelerate==1.6.0
+datasets==3.2.0
+vllm==0.8.5
+wandb==0.19.1
+pyyaml==6.0.2
+# Eval: HumanEval+ / MBPP+ with their expanded test suites
+evalplus==0.3.1

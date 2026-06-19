@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-rl-env"
+version = "0.1.0"
+description = "A decoupled, verifiable, multi-turn RL environment for code generation, with a GRPO client."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "datasets>=2.14",
+]
+
+[project.optional-dependencies]
+# GPU/training extras — not needed to import the env or run the unit tests.
+train = [
+    "torch",
+    "transformers>=4.44",
+    "peft>=0.11",
+    "numpy",
+    "matplotlib",
+    "tqdm",
+]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["code_rl_env"]

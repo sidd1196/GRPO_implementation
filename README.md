@@ -1,300 +1,171 @@
-# Git-RL: Process Reward Modeling for Code Generation
-
-A reference implementation of Process Supervision (PRM) for Coding Agents. Instead of optimizing for binary pass/fail (Outcome Reward), this loop optimizes for 'Git-Commit' trajectories using Group Relative Policy Optimization (GRPO).
-
-## Overview
-
-Traditional reinforcement learning for code generation suffers from sparse rewards - the model only receives feedback at the very end when code either passes or fails all tests. This makes training inefficient and unstable. Process Reward Modeling addresses this by providing dense, intermediate rewards at each step of the coding process, treating each Git commit as a state in a Markov Decision Process (MDP).
-
-This implementation demonstrates how to:
-- Model coding trajectories as sequences of Git commits
-- Provide dense rewards for syntax validation, diff application, and incremental test passing
-- Use GRPO to stabilize training on long-horizon reasoning traces
-- Leverage infrastructure optimizations for low-latency evaluation
-
-## Key Features
-
-- **Dense Rewards:** Implements intermediate rewards for Syntax, Diff Application, and Incremental Test Passing
-- **Commit-as-State:** Models the coding process as a Markov Decision Process (MDP) where every commit is a state transition
-- **GRPO Integration:** Uses Group Relative Policy Optimization to stabilize the training on these long-horizon reasoning traces
-- **Token-Level Advantages:** Assigns step-specific rewards to tokens generated in that commit step, enabling fine-grained credit assignment
-- **Multi-Turn Generation:** Supports multi-turn code generation where each turn represents a Git commit
-- **Infrastructure Ready:** Includes `infrastructure_mock.py` demonstrating the Firecracker Snapshot architecture for low-latency evaluation
-
-## Architecture
-
-```mermaid
-graph TD
-    A[Policy Model] -->|Generates Patch| B(Git Environment)
-    B -->|git apply| C{Syntax Check}
-    C -->|Fail| D[Reward: -0.1]
-    C -->|Pass| E{Unit Tests}
-    E -->|Pass New Test| F[Reward: +0.5]
-    E -->|Pass All| G[Reward: +1.0]
-    D --> H[GRPO Update]
-    F --> H
-    G --> H
-```
-
-## Installation
-
-### Requirements
-
-- Python 3.8+
-- PyTorch 1.9+ (with CUDA support recommended)
-- einops
-- matplotlib
-- tqdm
-
-### Install Dependencies
-
-```bash
-pip install torch einops matplotlib tqdm
-```
-
-Or using the requirements file:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Project Structure
-
-```
-GRPO_implementation/
-│
-├── grpo_implementation.py          # Main GRPO implementation with multi-turn support
-├── git_process_rewards.py          # Process reward modeling for Git commits
-├── infrastructure_mock.py          # Firecracker VM orchestration mock
-├── grpo_implementation.ipynb       # Jupyter notebook for experimentation
-├── README.md                       # This file
-└── requirements.txt                # Python dependencies
-```
-
-## Usage
-
-### Process Reward Modeling
-
-The `GitProcessReward` class calculates dense rewards for coding trajectories:
-
-```python
-from git_process_rewards import GitProcessReward
-
-reward_calculator = GitProcessReward()
-
-# Simulate a sequence of Git commits
-commits = [
-    "def add(a, b):\n    return a + b",
-    "def add(a, b):\n    return a + b\n\ndef subtract(a, b):\n    return a - b",
-    "def add(a, b):\n    return a + b\n\ndef subtract(a, b):\n    return a - b\n\ndef multiply(a, b):\n    return a * b"
-]
-
-# Compute step rewards
-rewards = reward_calculator.compute_step_rewards(commits)
-print(rewards)  # [0.1, 0.8, 1.6] - dense rewards for each step
-```
-
-### Multi-Turn GRPO Training
-
-The `GroupRelativePolicyOptimization` class supports multi-turn generation:
-
-```python
-from grpo_implementation import Model, GroupRelativePolicyOptimization
-import torch
-
-# Initialize model
-model = Model(vocab_size=100, embedding_dim=64, prompt_length=10, response_length=10)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = model.to(device)
-
-# Initialize GRPO trainer
-grpo = GroupRelativePolicyOptimization(
-    model=model,
-    num_turns=5,  # 5 commits per trajectory
-    num_responses=10,  # 10 trajectories per prompt
-    device=device
-)
-
-# Generate prompts
-prompts = torch.randint(0, 100, (2, 10), device=device)
-
-# Simulate rewards per step (from GitProcessReward)
-rewards_per_step = torch.tensor([
-    [[0.1, 0.3, 0.5, 0.8, 1.0], [0.1, 0.2, 0.4, 0.7, 0.9]],  # Batch 1, 2 trajectories
-    [[0.1, 0.4, 0.6, 0.9, 1.1], [0.1, 0.3, 0.5, 0.8, 1.0]]   # Batch 2, 2 trajectories
-], device=device)
-
-# Train step
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-loss = grpo.train_step(prompts, rewards_per_step, optimizer, loss_mode="clipped")
-```
-
-### Firecracker Infrastructure Mock
-
-The `FirecrackerEvaluator` simulates low-latency VM-based evaluation:
-
-```python
-from infrastructure_mock import FirecrackerEvaluator
-
-# Initialize evaluator with task snapshot
-evaluator = FirecrackerEvaluator(task_id="sorting_task")
-
-# Fork VM and evaluate code patch
-code_patch = """
-def sort_numbers(numbers):
-    return sorted(numbers)
-"""
-
-result = evaluator.fork_and_evaluate(code_patch)
-print(f"Syntax valid: {result['syntax_valid']}")
-print(f"Latency: {result['latency_ms']:.2f}ms")
-print(f"Test results: {result['test_results']}")
-```
-
-## Reward Structure
-
-The process reward model provides four types of rewards:
-
-1. **Syntactic Check (+0.1 or -0.1):** Validates Python syntax using `ast.parse()`. Invalid syntax immediately returns -0.1.
-
-2. **Diff Validity (+0.2):** Checks if the commit applies cleanly to the previous state. Simulates merge conflict detection.
-
-3. **Incremental Test Passing (+0.5):** Rewards passing new tests compared to the previous commit state. Encourages incremental progress.
-
-4. **Final Completion (+1.0):** Large reward if the final state passes all tests. Provides strong signal for successful completion.
-
-## Technical Details
-
-### Token-Level Advantage Assignment
-
-Instead of assigning the final reward to all tokens, this implementation assigns step-specific rewards to tokens generated in that commit step:
-
-- Each commit step generates tokens
-- Rewards from that step are assigned to those specific tokens
-- This enables fine-grained credit assignment and faster learning
-
-### Multi-Turn Generation
-
-The `GroupRelativePolicyOptimization` class supports multi-turn generation:
-
-- Each turn represents a Git commit
-- State evolves across turns (each commit builds on previous)
-- Rewards are computed per turn and assigned to tokens in that turn
-- GRPO stabilizes training across multiple turns
-
-### Firecracker Architecture
-
-The infrastructure mock demonstrates:
-
-- **Snapshot-based forking:** Load pre-warmed VM snapshots (~1ms vs Docker ~100ms)
-- **Copy-on-Write (CoW):** Multiple VMs share base memory, only modified pages are copied
-- **Shared memory injection:** Zero-copy code injection via shared memory
-- **Fail-fast syntax check:** Early return for invalid syntax to avoid VM overhead
-
-## Experiments
-
-### Single-Turn Training
-
-For simple tasks, use the original single-turn training:
-
-```python
-from grpo_implementation import run_policy_gradient, sort_inclusion_ordering_reward
-
-image_path, log_path = run_policy_gradient(
-    num_epochs=100,
-    num_steps_per_epoch=10,
-    num_responses=10,
-    deltas_mode="centered_rewards",
-    loss_mode="clipped",
-    reward_fn=sort_inclusion_ordering_reward,
-    use_cache=True,
-    device="cuda"
-)
-```
-
-### Multi-Turn Training
-
-For complex coding tasks, use multi-turn GRPO:
-
-```python
-from grpo_implementation import Model, GroupRelativePolicyOptimization
-from git_process_rewards import GitProcessReward
-
-# Setup
-model = Model(...)
-grpo = GroupRelativePolicyOptimization(model, num_turns=5, num_responses=10)
-reward_calc = GitProcessReward()
-
-# Training loop
-for epoch in range(num_epochs):
-    # Generate multi-turn trajectories
-    responses = grpo.generate_multi_turn_responses(prompts)
-    
-    # Compute process rewards
-    rewards_per_step = []
-    for batch in range(batch_size):
-        commits = [decode_commit(r) for r in responses[batch, 0, :, :]]
-        step_rewards = reward_calc.compute_step_rewards(commits)
-        rewards_per_step.append(step_rewards)
-    
-    rewards_per_step = torch.tensor(rewards_per_step)
-    
-    # Train step
-    loss = grpo.train_step(prompts, rewards_per_step, optimizer)
-```
-
-## Key Concepts
-
-### Process Supervision
-
-Process Supervision (PRM) provides intermediate feedback during code generation:
-
-- Instead of sparse binary rewards (pass/fail), provides dense step-by-step rewards
-- Makes the RL problem more tractable by reducing reward sparsity
-- Enables faster learning through better credit assignment
-
-### Commit-as-State MDP
-
-Modeling Git commits as MDP states:
-
-- Each commit is a state transition in the coding process
-- Actions are code patches/diffs
-- Rewards are computed at each commit step
-- Policy learns to generate sequences of valid, incremental commits
-
-### GRPO for Long-Horizon Reasoning
-
-Group Relative Policy Optimization stabilizes training:
-
-- Uses group structure (multiple responses per prompt) for natural baselines
-- Reduces variance without requiring separate value function network
-- Particularly effective for long-horizon reasoning tasks like code generation
-
-## References
-
-- **GRPO Paper:** Group Relative Policy Optimization (Yang et al., 2025)
-- **PPO Paper:** Proximal Policy Optimization Algorithms (Schulman et al., 2017)
-- **Process Reward Modeling:** Training Language Models to Follow Instructions with Human Feedback (OpenAI, 2022)
-- **Firecracker:** Firecracker: Lightweight Virtualization for Serverless Applications (Amazon, 2018)
-
-## Contributing
-
-This is a reference implementation for educational purposes. Feel free to:
-- Experiment with different reward structures
-- Try alternative baseline strategies
-- Extend to other sequence tasks
-- Optimize for larger models and longer trajectories
-
-## License
-
-This implementation is for educational purposes. Please refer to the original papers and course materials for licensing information.
-
-## Acknowledgments
-
-- PyTorch team for excellent deep learning framework
-- Firecracker project for VM orchestration architecture
-- Research community for process supervision and GRPO methods
+# A Decoupled, Multi-Turn Code-RL Environment (with a GRPO client)
+
+A small but complete **reinforcement-learning environment for code generation**, and a
+[GRPO](https://arxiv.org/abs/2402.03300) trainer built as a *client* of it. The environment
+exposes a Gym-style `reset()` / `step()` interface, computes reward by executing unit tests,
+supports a multi-turn *write → run tests → read the traceback → revise* loop, and is fully
+**unit-tested without a GPU**.
+
+The point of the design is separation of concerns: the environment knows *how a task is scored*;
+it knows nothing about *how a policy is trained*. GRPO is one consumer of the environment;
+evaluation is another. Any algorithm could be a third.
 
 ---
 
-**Note:** This implementation demonstrates Process Reward Modeling for code generation. For production use, refer to the official papers and implementations.
+## Why an "environment" and not a training loop
+
+A typical from-scratch GRPO script fuses three things into one loop: sampling tasks, computing
+the unit-test reward, and applying the policy update. That works, but it can't be tested without
+a GPU, the reward can't be reused by other algorithms, and it can't be made multi-turn. This
+repo factors those apart:
+
+| Layer | Module | Responsibility |
+|---|---|---|
+| Task | `code_rl_env/tasks.py` | `TaskSpec` + MBPP / HumanEval loaders → one task shape |
+| Sandbox | `code_rl_env/sandbox.py` | run code in a timed subprocess (never hangs the trainer) |
+| Verifier | `code_rl_env/verifier.py` | `ExecutionVerifier` → per-test pass/fail + error text |
+| Rubric | `code_rl_env/rubric.py` | `Rubric` → weighted blend of named reward functions |
+| Episode | `code_rl_env/episode.py` | `Turn` / `Trajectory` dataclasses |
+| **Environment** | `code_rl_env/environment.py` | **`CodeEnv` → Gym-style `reset()`/`step()`, multi-turn** |
+| Trainer (client) | `train_grpo.py` | rolls out trajectories, consumes the env's reward |
+
+The environment deals only in **text** (prompt in, completion out) and never imports
+`torch`/`transformers`, so it stays model-agnostic and trivially testable.
+
+```mermaid
+graph LR
+    P[Policy] -->|completion| E[CodeEnv.step]
+    E -->|Rubric| V[ExecutionVerifier]
+    V -->|run tests in sandbox| R[reward + feedback]
+    R -->|pass: done| Done[done]
+    R -->|fail: traceback| E2[next turn: revise]
+    E2 -.-> P
+    R -->|reward| G[GRPO update]
+```
+
+---
+
+## Quickstart
+
+```bash
+git clone https://github.com/sidd1196/GRPO_implementation.git
+cd GRPO_implementation
+
+# Install. The core env (and its tests) need only `datasets` — no GPU.
+pip install -e .
+
+# Prove the environment is correct, with no model and no GPU:
+pytest -q tests/        # 12 tests: verifier scoring + multi-turn rollout protocol
+```
+
+Using the environment directly:
+
+```python
+from code_rl_env import CodeEnv, TaskSpec
+
+task = TaskSpec(
+    task_id="demo/double", prompt="Return x doubled.",
+    tests=["assert f(2) == 4", "assert f(3) == 6"], entry_point="f", source="demo",
+)
+env = CodeEnv([task], max_turns=3)
+
+obs = env.reset(task)
+step = env.step("def f(x):\n    return x + 2")     # wrong -> reward < 1, not done
+print(step.reward, step.done)                       # 0.5 False
+print(step.observation.prompt_text)                 # shows the failing test, asks for a fix
+step = env.step("def f(x):\n    return x * 2")      # corrected -> reward 1.0, done
+print(step.reward, step.done, step.info["solved"])  # 1.0 True True
+```
+
+Reward composition is a swappable `Rubric` of weighted reward functions:
+
+```python
+from code_rl_env import default_rubric, dense_rubric
+# default_rubric() -> tests only
+# dense_rubric()   -> 0.8*tests + 0.1*syntax + 0.1*format(no markdown fences)
+```
+
+---
+
+## The GRPO experiment
+
+`train_grpo.py` is the GPU part — GRPO as a client of `CodeEnv`. For each step it rolls out
+`G` multi-turn trajectories on one task (a GRPO group), asks the environment for each
+trajectory's reward, group-normalises the rewards into advantages, and takes a clipped
+policy-gradient step. One loop runs two configs via `GRPOConfig`:
+
+- **GRPO baseline** — KL to a frozen reference, symmetric clip ε = 0.2.
+- **MicroCoder-GRPO** ([arxiv 2603.07777](https://arxiv.org/abs/2603.07777)) — three
+  code-specific fixes: no-KL + high upper clip (Fix 3), two-stage temperature (Fix 2), and
+  truncation masking (Fix 1).
+
+```python
+from code_rl_env import load_mbpp, load_humaneval, default_rubric
+from train_grpo import GRPOConfig, run_grpo, evaluate
+
+train_tasks = load_mbpp(limit=150)
+cfg = GRPOConfig(microcoder=True, num_steps=200, G=4, max_turns=3,
+                 kl_coeff=0.0, epsilon_high=0.5)
+log = run_grpo(policy, tokenizer, train_tasks, cfg, rubric=default_rubric())
+
+# evaluate() reports pass@1 for in-distribution (MBPP) AND transfer (HumanEval)
+evaluate(policy, tokenizer, load_humaneval(), default_rubric())["pass@1"]
+```
+
+Evaluation deliberately reports **both** held-out MBPP (in-distribution — where the policy is
+trained) and HumanEval (transfer). Reporting only the transfer number is what made an earlier
+version of this experiment look like RL *hurt*; separating the two gives an honest answer to
+"did the policy learn the trained distribution, and did it generalise?"
+
+> **Status:** the environment, verifier, rubric and rollout protocol are unit-tested and
+> green. The multi-turn GRPO training itself runs on a Colab A100 (model: Qwen2.5-Coder-1.5B
+> + LoRA); result tables are produced by running the driver notebook below. Single seed,
+> small model, 200 steps, coarse 3-test MBPP reward — this is a clean reference implementation,
+> not a leaderboard entry.
+
+---
+
+## Running on Colab
+
+`grpo_rlvr_dapo_code.ipynb` is a **teaching driver**: open it from GitHub in Colab
+(*File → Open notebook → GitHub*), and it clones this repo, installs the package, then walks
+through each layer of the environment with explanations before training and evaluating.
+
+---
+
+## Repository contents
+
+```
+GRPO_implementation/
+├── code_rl_env/                 # the RL environment package (no GPU needed to import/test)
+│   ├── tasks.py  sandbox.py  verifier.py  rubric.py  episode.py  environment.py
+├── tests/                       # 12 GPU-free unit tests
+├── train_grpo.py                # GRPO/MicroCoder-GRPO trainer + evaluator (env client)
+├── grpo_rlvr_dapo_code.ipynb    # teaching driver notebook (Colab)
+├── grpo_rlvr_dapo_inline_v1.ipynb  # earlier inline implementation, kept as a results record
+├── grpo_implementation.ipynb    # toy GRPO walkthrough (sorting task) — pedagogical origin
+├── git_process_rewards.py       # process-reward modeling: dense rewards over git-commit steps
+├── grpo_rft_code/               # production-stack variant (TRL GRPOTrainer + vLLM + YAML configs)
+├── build_driver_notebook.py     # regenerates the driver notebook
+├── pyproject.toml  requirements.txt
+```
+
+- **`git_process_rewards.py`** — a standalone exploration of *process supervision*: instead of a
+  single pass/fail reward, it assigns dense, intermediate rewards (syntax, diff validity,
+  incremental test passing) across a sequence of git commits modelled as an MDP.
+- **`grpo_rft_code/`** — the same experiment expressed on the production post-training stack
+  (TRL `GRPOTrainer`, PEFT LoRA, vLLM, YAML configs) rather than a hand-rolled loop. Scaffolded
+  for a config-driven "reinforcement fine-tuning" workflow.
+
+---
+
+## References
+
+- **GRPO** — DeepSeekMath: Pushing the Limits of Mathematical Reasoning (2024)
+- **DAPO** — an open-source LLM RL recipe (2025): dynamic sampling, decoupled clipping
+- **MicroCoder-GRPO** — code-specific GRPO fixes (arxiv 2603.07777)
+- **PPO** — Proximal Policy Optimization Algorithms (Schulman et al., 2017)
+
+## License
+
+Educational reference implementation.
