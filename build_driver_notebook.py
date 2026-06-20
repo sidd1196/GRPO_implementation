@@ -52,11 +52,25 @@ if not os.path.isdir(REPO) and not os.path.isdir("code_rl_env"):
 if os.path.isdir(REPO):
     %cd {REPO}
 !git pull -q 2>/dev/null
-!pip install -q -e ".[train,vllm]"
+!pip install -q -e ".[train]"
 # Colab's base image ships an old torchao that the installed peft rejects; we don't use it
 # (plain bf16 LoRA), so remove it to avoid an ImportError when building the LoRA policy.
 !pip uninstall -q -y torchao 2>/dev/null
-print("package installed")
+
+# vLLM (backend="vllm"): install the CUDA 12.8 wheel explicitly. vLLM's default wheel targets
+# CUDA 12.9/13.0, which fails against Colab's cu128 torch (`libcudart.so.13: not found`). The
+# cu128 wheel pins its own matching torch (~2.9+cu128), so torch may be downgraded — that's
+# expected and fine. Skip these two lines if you only use backend="hf_batched".
+import json, urllib.request
+_ver = json.load(urllib.request.urlopen(
+    "https://api.github.com/repos/vllm-project/vllm/releases/latest"))["tag_name"].lstrip("v")
+_wheel = (f"https://github.com/vllm-project/vllm/releases/download/v{_ver}/"
+          f"vllm-{_ver}+cu128-cp38-abi3-manylinux_2_35_x86_64.whl")
+!pip install -q "{_wheel}" --extra-index-url https://download.pytorch.org/whl/cu128
+
+print(f"package installed; vllm {_ver} (cu128)")
+print("⚠️ If torch was already imported this session, RESTART the runtime once "
+      "(Runtime → Restart session), then run from this cell.")
 """))
 
 cells.append(md(r"""
