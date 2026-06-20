@@ -22,6 +22,8 @@ train = [
     "matplotlib",
     "tqdm",
 ]
+# Fast rollout backend (actor): vLLM. Optional — only needed for backend="vllm".
+vllm = ["vllm>=0.4"]
 dev = ["pytest>=7"]
 
 [tool.setuptools]

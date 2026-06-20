@@ -52,7 +52,10 @@ if not os.path.isdir(REPO) and not os.path.isdir("code_rl_env"):
 if os.path.isdir(REPO):
     %cd {REPO}
 !git pull -q 2>/dev/null
-!pip install -q -e ".[train]"
+!pip install -q -e ".[train,vllm]"
+# Colab's base image ships an old torchao that the installed peft rejects; we don't use it
+# (plain bf16 LoRA), so remove it to avoid an ImportError when building the LoRA policy.
+!pip uninstall -q -y torchao 2>/dev/null
 print("package installed")
 """))
 
@@ -197,6 +200,14 @@ The same loop runs two configs via `GRPOConfig`:
 - **GRPO baseline** — KL to a frozen reference, symmetric clip ε=0.2.
 - **MicroCoder-GRPO** (arxiv 2603.07777) — the three code-specific fixes: no-KL + high upper
   clip (Fix 3), two-stage temperature (Fix 2), truncation masking (Fix 1).
+
+**Rollout backend (the actor / learner split).** Generation is the bottleneck, so we set
+`backend="vllm"`: a vLLM engine samples all `G` trajectories with continuous batching (the
+*actor*), while the policy takes gradient steps (the *learner*). After each step the trainer
+merges the LoRA adapter and pushes the weights into the running vLLM engine so the actor stays
+on-policy — the same architecture production RL stacks use, here at single-GPU colocated scale.
+This is ~10× faster than the naïve `model.generate()` loop; `backend="hf_batched"` (no vLLM) is
+the fallback.
 """))
 
 cells.append(code(r"""
@@ -254,7 +265,8 @@ for p in ref.parameters():
     p.requires_grad_(False)
 
 grpo_cfg = GRPOConfig(microcoder=False, num_steps=200, G=4, max_turns=3,
-                      kl_coeff=0.01, epsilon_low=0.2, epsilon_high=0.2, temperature=0.8)
+                      kl_coeff=0.01, epsilon_low=0.2, epsilon_high=0.2, temperature=0.8,
+                      backend="vllm")            # actor/learner split; "hf_batched" if vLLM unavailable
 grpo_log = run_grpo(policy, tokenizer, train_tasks, grpo_cfg,
                     ref_model=ref, rubric=rubric, eval_tasks=eval_mbpp)
 
@@ -271,7 +283,8 @@ mc_policy = fresh_policy()
 mc_cfg = GRPOConfig(microcoder=True, num_steps=200, G=4, max_turns=3,
                     kl_coeff=0.0, epsilon_low=0.2, epsilon_high=0.5,
                     temp_stage1=0.7, temp_stage2=1.0, temp_switch_step=100,
-                    mask_prob=0.3, repeat_check_len=128)
+                    mask_prob=0.3, repeat_check_len=128,
+                    backend="vllm")
 mc_log = run_grpo(mc_policy, tokenizer, train_tasks, mc_cfg,
                   ref_model=None, rubric=rubric, eval_tasks=eval_mbpp)
 

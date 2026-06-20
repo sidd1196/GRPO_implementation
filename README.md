@@ -6,6 +6,13 @@ exposes a Gym-style `reset()` / `step()` interface, computes reward by executing
 supports a multi-turn *write → run tests → read the traceback → revise* loop, and is fully
 **unit-tested without a GPU**.
 
+Rollouts (the slow part — generating the model's code attempts) run through a **pluggable
+backend**: a fast [vLLM](https://github.com/vllm-project/vllm) engine that batches all the
+group's samples and serves them with continuous batching, with batched-HuggingFace and
+single-sequence fallbacks. The GRPO algorithm itself — group-relative advantages, the clipped
+objective, the KL term, multi-turn credit assignment — stays hand-written in `train_grpo.py`;
+vLLM is *only* the sampler.
+
 The point of the design is separation of concerns: the environment knows *how a task is scored*;
 it knows nothing about *how a policy is trained*. GRPO is one consumer of the environment;
 evaluation is another. Any algorithm could be a third.
@@ -27,6 +34,7 @@ repo factors those apart:
 | Rubric | `code_rl_env/rubric.py` | `Rubric` → weighted blend of named reward functions |
 | Episode | `code_rl_env/episode.py` | `Turn` / `Trajectory` dataclasses |
 | **Environment** | `code_rl_env/environment.py` | **`CodeEnv` → Gym-style `reset()`/`step()`, multi-turn** |
+| Rollout backend | `train_grpo.py` | generation backend: `vllm` (fast, batched) / `hf_batched` / `hf`, with per-step weight sync |
 | Trainer (client) | `train_grpo.py` | rolls out trajectories, consumes the env's reward |
 
 The environment deals only in **text** (prompt in, completion out) and never imports
@@ -34,13 +42,15 @@ The environment deals only in **text** (prompt in, completion out) and never imp
 
 ```mermaid
 graph LR
-    P[Policy] -->|completion| E[CodeEnv.step]
+    P[Policy + LoRA] -->|"merge LoRA, sync weights"| B["Rollout backend<br/>(vLLM / batched HF)"]
+    B -->|completion| E[CodeEnv.step]
     E -->|Rubric| V[ExecutionVerifier]
     V -->|run tests in sandbox| R[reward + feedback]
     R -->|pass: done| Done[done]
     R -->|fail: traceback| E2[next turn: revise]
-    E2 -.-> P
+    E2 -.-> B
     R -->|reward| G[GRPO update]
+    G -.->|gradient step| P
 ```
 
 ---
@@ -99,13 +109,57 @@ policy-gradient step. One loop runs two configs via `GRPOConfig`:
   code-specific fixes: no-KL + high upper clip (Fix 3), two-stage temperature (Fix 2), and
   truncation masking (Fix 1).
 
+### Fast rollouts — the actor / learner split
+
+In a from-scratch loop the slowest part by far is **generation**: each GRPO step samples `G`
+multi-turn trajectories, so a naïve loop calls `model.generate()` up to `G × max_turns` times,
+one sequence at a time, leaving the GPU mostly idle. Production RL stacks fix this by separating
+the **actor** (a fast inference engine that only samples) from the **learner** (the training
+model that takes gradient steps). This repo mirrors that split:
+
+```mermaid
+graph TB
+    subgraph Learner["GRPO trainer  (learner — your code)"]
+        POL["Policy + LoRA"]
+        LP["log-probs + advantages"]
+        LOSS["clipped PG loss + KL"]
+        OPT["AdamW step"]
+        POL --> LP --> LOSS --> OPT --> POL
+    end
+    subgraph Actor["Rollout backend  (actor — sampler only)"]
+        VLLM["vLLM engine<br/>(batched, continuous batching)"]
+    end
+    OPT -->|"① merge LoRA → sync weights (every step)"| VLLM
+    VLLM -->|"② G completions (one batched call)"| ENV
+    subgraph EnvBox["CodeEnv  (reward — no GPU)"]
+        ENV["step → Rubric → run tests"]
+    end
+    ENV -->|"③ reward + feedback"| LP
+```
+
+The trainer selects the backend with `GRPOConfig.backend`:
+
+| `backend` | What it does | Speed | Needs |
+|---|---|---|---|
+| `"vllm"` | vLLM samples all `G` trajectories with continuous batching; policy weights synced in each step | **~10×** | `vllm` installed, GPU |
+| `"hf_batched"` | one batched `model.generate()` per turn across the live trajectories | ~3–5× | GPU |
+| `"hf"` | original one-sequence-at-a-time loop (reference / debugging) | 1× | GPU |
+
+**Weight sync (the one subtlety).** The learner trains a LoRA adapter, but vLLM serves the
+*merged* model. After each optimizer step the trainer merges the adapter into the base weights
+(`merge_adapter()`), pushes them into the running vLLM engine, then unmerges so training
+continues on the adapter. This keeps the actor's samples on-policy without rebuilding the
+engine. It is the only place the two models touch — the GRPO math is unchanged, so `"vllm"`
+and `"hf"` produce the same algorithm, only at different speeds.
+
 ```python
 from code_rl_env import load_mbpp, load_humaneval, default_rubric
 from train_grpo import GRPOConfig, run_grpo, evaluate
 
 train_tasks = load_mbpp(limit=150)
 cfg = GRPOConfig(microcoder=True, num_steps=200, G=4, max_turns=3,
-                 kl_coeff=0.0, epsilon_high=0.5)
+                 kl_coeff=0.0, epsilon_high=0.5,
+                 backend="vllm")            # "vllm" | "hf_batched" | "hf"
 log = run_grpo(policy, tokenizer, train_tasks, cfg, rubric=default_rubric())
 
 # evaluate() reports pass@1 for in-distribution (MBPP) AND transfer (HumanEval)
@@ -119,9 +173,9 @@ version of this experiment look like RL *hurt*; separating the two gives an hone
 
 > **Status:** the environment, verifier, rubric and rollout protocol are unit-tested and
 > green. The multi-turn GRPO training itself runs on a Colab A100 (model: Qwen2.5-Coder-1.5B
-> + LoRA); result tables are produced by running the driver notebook below. Single seed,
-> small model, 200 steps, coarse 3-test MBPP reward — this is a clean reference implementation,
-> not a leaderboard entry.
+> + LoRA, `backend="vllm"`); result tables are produced by running the driver notebook below.
+> Single seed, small model, 200 steps, coarse 3-test MBPP reward — this is a clean reference
+> implementation, not a leaderboard entry.
 
 ---
 
