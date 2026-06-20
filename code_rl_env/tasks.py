@@ -31,9 +31,12 @@ def _entry_from_asserts(tests: List[str]) -> str:
     return ""
 
 
-def load_mbpp(split: str = "train", limit: Optional[int] = None) -> List[TaskSpec]:
+def load_mbpp(split: str = "train+validation+test", limit: Optional[int] = None) -> List[TaskSpec]:
     from datasets import load_dataset
 
+    # The sanitized config's `train` split has only 120 problems — too few for a
+    # 150-train / 30-eval split. Concatenating train+validation+test yields ~420
+    # tasks (all carry the `prompt` field), so downstream slicing has room.
     raw = load_dataset("google-research-datasets/mbpp", "sanitized", split=split)
     tasks: List[TaskSpec] = []
     for i in range(len(raw)):
