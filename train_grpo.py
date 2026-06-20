@@ -194,10 +194,23 @@ def _merged_state_dict(policy):
     return cleaned
 
 
+def _vllm_load_weights(worker, weights):
+    """Runs *inside* the vLLM worker (via collective_rpc): load merged weights into the live
+    model. With the engine in-process (colocated), `weights` are the trainer's GPU tensors —
+    no cross-process copy."""
+    worker.model_runner.model.load_weights(weights)
+
+
 class VLLMRollout:
     """A vLLM engine used purely as the sampler, with per-step weight sync from the policy."""
 
     def __init__(self, model_name: str, tokenizer, cfg: GRPOConfig):
+        import os
+        # Keep the V1 engine in the SAME process (no worker subprocess) so weight sync can hand
+        # the policy's GPU tensors straight to the model. V1's default multiprocessing moves the
+        # model into a separate process, which both breaks the old model path and would force us
+        # to copy ~3GB of weights across processes every step.
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         from vllm import LLM
         self.tokenizer = tokenizer
         self.cfg = cfg
@@ -211,7 +224,13 @@ class VLLMRollout:
         )
 
     def sync_weights(self, policy) -> None:
-        _get_vllm_model(self.llm).load_weights(_merged_state_dict(policy))
+        weights = _merged_state_dict(policy)
+        # Preferred (V1): run load_weights inside the worker via collective_rpc.
+        try:
+            self.llm.collective_rpc(_vllm_load_weights, args=(weights,))
+        except (AttributeError, TypeError):
+            # Fallback for older (V0) engines that expose the model in-process.
+            _get_vllm_model(self.llm).load_weights(weights)
 
     def close(self) -> None:
         """Release the engine's GPU memory so a second run can build a fresh one."""
