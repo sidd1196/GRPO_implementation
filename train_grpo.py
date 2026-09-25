@@ -25,6 +25,7 @@ Requires the `train` extra:  pip install -e ".[train]"   (+ ".[vllm]" for backen
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -312,11 +313,13 @@ class TrajTokens:
 
 
 def rollout_group(gen_fn: GenFn, task: TaskSpec, rubric: Rubric, cfg: GRPOConfig,
-                  temperature: float, rng: random.Random
+                  temperature: float, rng: random.Random, timings: Optional[Dict] = None
                   ) -> Tuple[List[Trajectory], List[TrajTokens]]:
     """Roll out G multi-turn trajectories on the SAME task (one GRPO group), stepping all
     live trajectories *in lockstep* so each turn's generations are produced in one batched
-    call (the backend decides how to batch)."""
+    call (the backend decides how to batch). If `timings` is given, seconds spent in
+    generation vs. sandbox execution are added to timings["t_gen"] / timings["t_env"]."""
+    timings = timings if timings is not None else {"t_gen": 0.0, "t_env": 0.0}
     envs, obss = [], []
     trajs: List[Trajectory] = []
     tokens: List[TrajTokens] = []
@@ -331,7 +334,9 @@ def rollout_group(gen_fn: GenFn, task: TaskSpec, rubric: Rubric, cfg: GRPOConfig
     active = list(range(cfg.G))
     while active:
         prompts = [(system_prompt, obss[i].prompt_text) for i in active]
+        t0 = _now()
         gens = gen_fn(prompts, temperature)
+        t1 = _now()
         still_active = []
         for idx, (p_ids, c_ids, text, trunc) in zip(active, gens):
             sr = envs[idx].step(text)
@@ -342,6 +347,8 @@ def rollout_group(gen_fn: GenFn, task: TaskSpec, rubric: Rubric, cfg: GRPOConfig
             obss[idx] = sr.observation
             if not sr.done:
                 still_active.append(idx)
+        timings["t_gen"] += t1 - t0
+        timings["t_env"] += time.perf_counter() - t1   # sandbox is CPU-only: no GPU sync needed
         active = still_active
     return trajs, tokens
 
@@ -350,6 +357,28 @@ def _is_repetitive(comp_ids: torch.Tensor, m: int) -> bool:
     if len(comp_ids) < 2 * m:
         return False
     return comp_ids[-m:].tolist() == comp_ids[-2 * m:-m].tolist()
+
+
+# ── timing ───────────────────────────────────────────────────────────────────────
+def _now() -> float:
+    """Wall-clock time after waiting for queued GPU work. CUDA calls return before the GPU
+    finishes, so without synchronize() a timer would charge work to the wrong phase."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def timing_summary(log: Dict, skip_first: int = 1) -> Dict[str, float]:
+    """Mean seconds per step for each phase (step 0 skipped: it includes warm-up), plus the
+    share of each step the GPU does no useful work (sandbox execution + weight sync)."""
+    phases = ("t_gen", "t_env", "t_train", "t_sync")
+    mean = {k: sum(log[k][skip_first:]) / max(1, len(log[k]) - skip_first) for k in phases}
+    total = sum(mean.values())
+    out = {**mean, "t_step": total,
+           "gpu_idle_frac": (mean["t_env"] + mean["t_sync"]) / total if total else 0.0}
+    for k in ("trunc_rate", "timeout_rate", "comp_len_mean", "comp_len_max"):
+        out[k] = sum(log[k]) / len(log[k])
+    return out
 
 
 # ── training loop ──────────────────────────────────────────────────────────────
@@ -375,7 +404,10 @@ def run_grpo(policy, tokenizer, train_tasks: List[TaskSpec], cfg: GRPOConfig,
 
     log = {k: [] for k in ("steps", "losses", "rewards", "reward_stds", "entropies",
                            "grad_norms", "kl", "temperatures", "solve_rate", "mean_turns",
-                           "eval_steps", "eval_accs")}
+                           "eval_steps", "eval_accs",
+                           # timing / "what broke" diagnostics, one entry per step
+                           "t_gen", "t_env", "t_train", "t_sync",
+                           "trunc_rate", "timeout_rate", "comp_len_mean", "comp_len_max")}
 
     for step in tqdm(range(cfg.num_steps), desc=f"{mode} training"):
         task = rng.choice(train_tasks)
@@ -386,7 +418,9 @@ def run_grpo(policy, tokenizer, train_tasks: List[TaskSpec], cfg: GRPOConfig,
         else:
             temperature = cfg.temperature
 
-        trajs, tokens = rollout_group(gen_fn, task, rubric, cfg, temperature, rng)
+        timings = {"t_gen": 0.0, "t_env": 0.0}
+        trajs, tokens = rollout_group(gen_fn, task, rubric, cfg, temperature, rng, timings)
+        t_train0 = _now()
 
         # reward per trajectory -> group-normalised advantage
         if cfg.reward_mode == "best":
@@ -433,10 +467,25 @@ def run_grpo(policy, tokenizer, train_tasks: List[TaskSpec], cfg: GRPOConfig,
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
+        t_sync0 = _now()
 
-        # actor/learner sync: push the freshly-updated (merged) weights into the vLLM engine
+        # actor/learner sync: push the freshly-updated (merged) weights into the vLLM engine.
+        # Nothing else runs meanwhile — the GPU neither samples nor trains (hf backends: 0s).
         if vllm_backend is not None:
             vllm_backend.sync_weights(policy)
+        t_sync1 = _now()
+
+        comp_lens = [len(c) for tt in tokens for _, c in tt.turns]
+        all_turns = [turn for t in trajs for turn in t.turns]
+        log["t_gen"].append(timings["t_gen"])
+        log["t_env"].append(timings["t_env"])
+        log["t_train"].append(t_sync0 - t_train0)
+        log["t_sync"].append(t_sync1 - t_sync0)
+        log["trunc_rate"].append(sum(f for tt in tokens for f in tt.truncated_flags) / len(comp_lens))
+        log["timeout_rate"].append(sum(turn.info.get("timed_out", False) for turn in all_turns)
+                                   / len(all_turns))
+        log["comp_len_mean"].append(sum(comp_lens) / len(comp_lens))
+        log["comp_len_max"].append(max(comp_lens))
 
         log["steps"].append(step)
         log["losses"].append(loss.item())

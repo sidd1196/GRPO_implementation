@@ -19,6 +19,7 @@ class TestResult:
     test: str
     passed: bool
     error: str = ""
+    timed_out: bool = False        # killed by the sandbox timeout (vs. a normal failure)
 
 
 @dataclass
@@ -38,6 +39,10 @@ class VerificationResult:
     @property
     def fraction_passed(self) -> float:
         return self.n_passed / self.n_total if self.n_total else 0.0
+
+    @property
+    def any_timed_out(self) -> bool:
+        return any(t.timed_out for t in self.test_results)
 
     @property
     def all_passed(self) -> bool:
@@ -77,5 +82,6 @@ class ExecutionVerifier:
                 test=test,
                 passed=r.ok,
                 error="" if r.ok else (r.stderr or "non-zero exit"),
+                timed_out=r.timed_out,
             ))
         return VerificationResult(code=code, syntax_ok=True, test_results=results)

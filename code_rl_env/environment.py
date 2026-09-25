@@ -105,5 +105,6 @@ class CodeEnv:
             "n_total": vr.n_total,
             "solved": solved,
             "syntax_ok": vr.syntax_ok,
+            "timed_out": vr.any_timed_out,
         }
         return StepResult(next_obs, reward, done, info)

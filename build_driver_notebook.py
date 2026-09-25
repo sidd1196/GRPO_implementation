@@ -57,24 +57,7 @@ if os.path.isdir(REPO):
 # (plain bf16 LoRA), so remove it to avoid an ImportError when building the LoRA policy.
 !pip uninstall -q -y torchao 2>/dev/null
 
-# vLLM (backend="vllm"): vLLM's default wheel targets CUDA 13, which fails against Colab's
-# cu128 torch (`libcudart.so.13: not found`). Install a CUDA 12.x wheel (cu128/cu129 — both
-# share libcudart.so.12, compatible with the driver) picked straight from the release assets,
-# so we don't depend on the exact filename pattern. It pins its own matching torch, so torch
-# may be downgraded — that's expected. Skip this block if you only use backend="hf_batched".
-import json, urllib.request
-_rel = json.load(urllib.request.urlopen(
-    "https://api.github.com/repos/vllm-project/vllm/releases/latest"))
-_ver = _rel["tag_name"].lstrip("v")
-_assets = {a["name"]: a["browser_download_url"] for a in _rel["assets"]}
-_pick = next(((tag, url) for tag in ("cu128", "cu129")
-              for name, url in _assets.items()
-              if f"+{tag}" in name and name.endswith("x86_64.whl")), None)
-assert _pick, f"no cu12x x86_64 wheel in vllm {_ver}: {sorted(_assets)}"
-_tag, _url = _pick
-!pip install -q "{_url}" --extra-index-url https://download.pytorch.org/whl/{_tag}
-
-print(f"package installed; vllm {_ver} ({_tag})")
+print("package installed")
 print("⚠️ If torch was already imported this session, RESTART the runtime once "
       "(Runtime → Restart session), then run from this cell.")
 """))
@@ -221,13 +204,12 @@ The same loop runs two configs via `GRPOConfig`:
 - **MicroCoder-GRPO** (arxiv 2603.07777) — the three code-specific fixes: no-KL + high upper
   clip (Fix 3), two-stage temperature (Fix 2), truncation masking (Fix 1).
 
-**Rollout backend (the actor / learner split).** Generation is the bottleneck, so we set
-`backend="vllm"`: a vLLM engine samples all `G` trajectories with continuous batching (the
-*actor*), while the policy takes gradient steps (the *learner*). After each step the trainer
-merges the LoRA adapter and pushes the weights into the running vLLM engine so the actor stays
-on-policy — the same architecture production RL stacks use, here at single-GPU colocated scale.
-This is ~10× faster than the naïve `model.generate()` loop; `backend="hf_batched"` (no vLLM) is
-the fallback.
+**Rollout backend.** We use `backend="hf_batched"`: each turn, the `G` live trajectories are
+generated in one batched `model.generate()` call on the policy itself. Because the sampler *is*
+the policy, there is no weight sync — but sampling and training still run one after the other,
+so the loop is synchronous and on-policy. `run_grpo` logs per-step generation / sandbox /
+training / sync time; `timing_summary(log)` reports the breakdown. (`backend="vllm"` — a separate
+sampler engine with per-step weight sync — is still in `train_grpo.py` but not used here.)
 """))
 
 cells.append(code(r"""
@@ -235,7 +217,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, TaskType
 from code_rl_env import load_mbpp, load_humaneval, default_rubric
-from train_grpo import GRPOConfig, run_grpo, evaluate
+from train_grpo import GRPOConfig, run_grpo, evaluate, timing_summary
 
 BASE_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 dtype = torch.bfloat16
@@ -286,13 +268,15 @@ for p in ref.parameters():
 
 grpo_cfg = GRPOConfig(microcoder=False, num_steps=200, G=4, max_turns=3,
                       kl_coeff=0.01, epsilon_low=0.2, epsilon_high=0.2, temperature=0.8,
-                      backend="vllm")            # actor/learner split; "hf_batched" if vLLM unavailable
+                      backend="hf_batched")      # one batched model.generate() per turn
 grpo_log = run_grpo(policy, tokenizer, train_tasks, grpo_cfg,
                     ref_model=ref, rubric=rubric, eval_tasks=eval_mbpp)
 
 grpo_mbpp = evaluate(policy, tokenizer, eval_mbpp, rubric)["pass@1"]
 grpo_he   = evaluate(policy, tokenizer, humaneval, rubric)["pass@1"]
 print(f"GRPO   MBPP(in-dist)={grpo_mbpp:.3f}   HumanEval(transfer)={grpo_he:.3f}")
+for k, v in timing_summary(grpo_log).items():
+    print(f"  {k:15s} {v:.3f}")
 del policy, ref; torch.cuda.empty_cache()
 """))
 
@@ -304,13 +288,15 @@ mc_cfg = GRPOConfig(microcoder=True, num_steps=200, G=4, max_turns=3,
                     kl_coeff=0.0, epsilon_low=0.2, epsilon_high=0.5,
                     temp_stage1=0.7, temp_stage2=1.0, temp_switch_step=100,
                     mask_prob=0.3, repeat_check_len=128,
-                    backend="vllm")
+                    backend="hf_batched")
 mc_log = run_grpo(mc_policy, tokenizer, train_tasks, mc_cfg,
                   ref_model=None, rubric=rubric, eval_tasks=eval_mbpp)
 
 mc_mbpp = evaluate(mc_policy, tokenizer, eval_mbpp, rubric)["pass@1"]
 mc_he   = evaluate(mc_policy, tokenizer, humaneval, rubric)["pass@1"]
 print(f"MicroCoder-GRPO   MBPP(in-dist)={mc_mbpp:.3f}   HumanEval(transfer)={mc_he:.3f}")
+for k, v in timing_summary(mc_log).items():
+    print(f"  {k:15s} {v:.3f}")
 """))
 
 cells.append(md("## 7 · Results — in-distribution vs transfer"))
