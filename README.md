@@ -1,225 +1,309 @@
-# A Decoupled, Multi-Turn Code-RL Environment (with a GRPO client)
+# GRPO for Code: a Small RL Environment, Two Training Methods, and Where the Time Goes
 
-A small but complete **reinforcement-learning environment for code generation**, and a
-[GRPO](https://arxiv.org/abs/2402.03300) trainer built as a *client* of it. The environment
-exposes a Gym-style `reset()` / `step()` interface, computes reward by executing unit tests,
-supports a multi-turn *write → run tests → read the traceback → revise* loop, and is fully
-**unit-tested without a GPU**.
+This repo teaches a small code model (**Qwen2.5-Coder-1.5B-Instruct**) to write better Python
+functions using reinforcement learning (**GRPO**), and measures what the training loop spends
+its time on.
 
-Rollouts (the slow part — generating the model's code attempts) run through a **pluggable
-backend**: a fast [vLLM](https://github.com/vllm-project/vllm) engine that batches all the
-group's samples and serves them with continuous batching, with batched-HuggingFace and
-single-sequence fallbacks. The GRPO algorithm itself — group-relative advantages, the clipped
-objective, the KL term, multi-turn credit assignment — stays hand-written in `train_grpo.py`;
-vLLM is *only* the sampler.
+It has three parts:
 
-The point of the design is separation of concerns: the environment knows *how a task is scored*;
-it knows nothing about *how a policy is trained*. GRPO is one consumer of the environment;
-evaluation is another. Any algorithm could be a third.
+1. **An RL environment for code.** It hands the model a coding problem, runs the model's
+   code against unit tests in a sandbox, and returns a score.
+2. **A GRPO trainer.** It uses those scores to update the model. Two variants are compared:
+   plain GRPO and MicroCoder-GRPO.
+3. **Timing instrumentation.** Every training step records how long it spent generating,
+   running tests, and training, so we can see where GPU time is wasted.
 
 ---
 
-## Why an "environment" and not a training loop
+## Where things stand (Sept 2026)
 
-A typical from-scratch GRPO script fuses three things into one loop: sampling tasks, computing
-the unit-test reward, and applying the policy update. That works, but it can't be tested without
-a GPU, the reward can't be reused by other algorithms, and it can't be made multi-turn. This
-repo factors those apart:
+- Full run completed on a Colab **G4** GPU: base model vs GRPO vs MicroCoder-GRPO,
+  200 training steps each, single seed.
+- Per-step timing recorded: **~80% of every step is generation**, ~10–13% is running
+  tests (GPU idle), and only ~7–9% is training.
+- Results, logs and plots are saved; the executed notebook is `grpo_run_results.ipynb`.
+- **RL did not meaningfully improve accuracy at this scale.** The run is small (800
+  rollouts in total), so the accuracy differences are within noise. The honest findings are
+  about **how the loop behaves**, not about a better model. Details below.
 
-| Layer | Module | Responsibility |
-|---|---|---|
-| Task | `code_rl_env/tasks.py` | `TaskSpec` + MBPP / HumanEval loaders → one task shape |
-| Sandbox | `code_rl_env/sandbox.py` | run code in a timed subprocess (never hangs the trainer) |
-| Verifier | `code_rl_env/verifier.py` | `ExecutionVerifier` → per-test pass/fail + error text |
-| Rubric | `code_rl_env/rubric.py` | `Rubric` → weighted blend of named reward functions |
-| Episode | `code_rl_env/episode.py` | `Turn` / `Trajectory` dataclasses |
-| **Environment** | `code_rl_env/environment.py` | **`CodeEnv` → Gym-style `reset()`/`step()`, multi-turn** |
-| Rollout backend | `train_grpo.py` | generation backend: `vllm` (fast, batched) / `hf_batched` / `hf`, with per-step weight sync |
-| Trainer (client) | `train_grpo.py` | rolls out trajectories, consumes the env's reward |
+---
 
-The environment deals only in **text** (prompt in, completion out) and never imports
-`torch`/`transformers`, so it stays model-agnostic and trivially testable.
+## How it works
+
+One training step, in plain words:
 
 ```mermaid
-graph LR
-    P[Policy + LoRA] -->|"merge LoRA, sync weights"| B["Rollout backend<br/>(vLLM / batched HF)"]
-    B -->|completion| E[CodeEnv.step]
-    E -->|Rubric| V[ExecutionVerifier]
-    V -->|run tests in sandbox| R[reward + feedback]
-    R -->|pass: done| Done[done]
-    R -->|fail: traceback| E2[next turn: revise]
-    E2 -.-> B
-    R -->|reward| G[GRPO update]
-    G -.->|gradient step| P
+flowchart LR
+    A[Pick a coding problem] --> B[Model writes 4 answers]
+    B --> C[Run each answer's tests<br/>in a sandbox]
+    C --> D[Score each answer<br/>e.g. 1.0, 0.33, 0, 0]
+    D --> E[GRPO: push the model toward<br/>above-average answers]
+    E --> A
 ```
+
+- **Why 4 answers?** GRPO has no separate "critic" model. It judges each answer by comparing
+  it to the other answers for the *same* problem. An answer that beats the group average
+  gets reinforced; one below average gets discouraged.
+- **Partial credit.** An answer that passes 1 of 3 tests scores 0.33, not 0. That gives the
+  model something to learn from even when no answer is fully correct.
+- **Multi-turn.** If an answer fails, the model sees its own code plus the failing test and
+  error message, and gets up to 3 attempts in total.
 
 ---
 
-## Quickstart
+## The code, file by file
+
+The environment knows *how to score code*. It knows nothing about *how the model is
+trained*. That separation means the environment can be tested without a GPU, and any
+training method could use it.
+
+| File | What it does |
+|---|---|
+| `code_rl_env/tasks.py` | Loads coding problems (MBPP, HumanEval) into one common format |
+| `code_rl_env/sandbox.py` | Runs code in a separate process with a 5-second time limit |
+| `code_rl_env/verifier.py` | Runs each test and reports pass/fail, the error, and whether it timed out |
+| `code_rl_env/rubric.py` | Turns test results into a score (fraction of tests passed) |
+| `code_rl_env/episode.py` | Small data classes that record each turn of an attempt |
+| `code_rl_env/environment.py` | The environment: `reset()` gives a problem, `step(code)` scores it |
+| `train_grpo.py` | The GRPO trainer, the timing instrumentation, and evaluation |
+| `tests/` | 12 unit tests for the environment. They run without a GPU. |
+| `grpo_rlvr_dapo_code.ipynb` | The notebook that runs everything on Colab |
+
+---
+
+## The experiment
+
+Both methods train the same model with LoRA (a small set of extra trainable weights) for
+200 steps. Each step uses one problem and 4 answers, with up to 3 attempts per answer.
+
+| | GRPO (baseline) | MicroCoder-GRPO |
+|---|---|---|
+| Stay close to the original model (KL penalty) | yes (0.01) | no |
+| Sampling temperature | 0.8 fixed | 0.7, then 1.0 from step 100 |
+| Don't punish answers cut off at the length limit | no | yes (30% of the time) |
+| Allow larger updates (upper clip) | 0.2 | 0.5 |
+
+MicroCoder-GRPO comes from [arXiv 2603.07777](https://arxiv.org/abs/2603.07777).
+
+**An honest caveat:** in this run, two of MicroCoder's three fixes had almost no effect.
+
+- **The larger upper clip never applies.** The loop is synchronous and on-policy, so the
+  importance ratio (new policy ÷ policy that generated the data) is always exactly 1. A clip
+  on a ratio that is always 1 does nothing.
+- **Truncation masking rarely triggers.** Only ~3–4% of answers hit the 256-token limit.
+
+So the real difference between the two runs is **temperature schedule + KL on/off**.
+
+**Evaluation.** After training, each model answers every problem once, greedily (no
+randomness). **pass@1** is the fraction solved on that first try. We measure two things:
+
+- **MBPP held-out (30 problems):** same kind of problems as training.
+- **HumanEval (164 problems):** different problems, to see if the skill transfers.
+
+---
+
+## Results
+
+| Model | MBPP (30) | HumanEval (164) |
+|---|---|---|
+| Base (no training) | 0.667 (20) | 0.567 (93) |
+| GRPO | 0.700 (21) | 0.537 (88) |
+| MicroCoder-GRPO | 0.667 (20) | 0.561 (92) |
+
+**Paired comparison:** on how many problems did one method succeed where the other failed?
+
+| | Only GRPO solved | Only MicroCoder solved |
+|---|---|---|
+| MBPP | 1 | 0 |
+| HumanEval | 1 | 5 |
+
+**What this does and doesn't show:**
+
+- **Neither method clearly beats the base model.** GRPO's MBPP gain is 1 problem out of 30,
+  which is noise.
+- On HumanEval, GRPO lost 5 problems compared with the base model; MicroCoder lost 1.
+- The paired 5-vs-1 points the same way as an earlier run with a different evaluation setup
+  (5-vs-0), but it is **not statistically significant** (sign test, p ≈ 0.22). Treat it as a direction, not proof.
+- **Why so little change:** only 800 rollouts in total, low-rank LoRA with a small learning
+  rate, and many steps where all 4 answers scored the same (see below). The mid-training
+  MBPP evaluation stayed between 0.633 and 0.700, which shows the model barely moved.
+- **Absolute numbers aren't comparable to the official leaderboard.** Qwen reports HumanEval
+  70.7 / MBPP 69.2 for this model
+  ([Qwen2.5-Coder report](https://arxiv.org/abs/2409.12186)). This repo uses its own prompt
+  and grading, and a 30-problem MBPP subset. Only comparisons *within* this repo are valid.
+
+---
+
+## Where the time goes
+
+Every step does three things, one after another. Nothing overlaps.
+
+```
+ one training step (~6 s)
+ |========== generate 4 answers (4.7-4.9 s) ==========|-- tests --|- train -|
+                    GPU busy                            GPU idle    GPU busy
+```
+
+Mean seconds per step (step 0 excluded because it includes warm-up):
+
+| Phase | GRPO | MicroCoder | Share of step |
+|---|---|---|---|
+| Generate answers | 4.71 s | 4.90 s | ~80% |
+| Run tests (GPU idle) | 0.61 s | 0.82 s | ~10–13% |
+| Train (forward + backward + update) | 0.52 s | 0.42 s | ~7–9% |
+| Weight sync | 0 | 0 | — |
+| **Total** | **5.83 s** | **6.14 s** | |
+
+Weight sync is 0 because generation and training use the same model object, so there's
+nothing to copy.
+
+**How this compares to published numbers.** [RollPacker (2025)](https://arxiv.org/abs/2509.21009)
+measured synchronous GRPO on a code task with a 14B model on 32 H800 GPUs:
+
+| | RollPacker (14B, code) | This repo (1.5B, one G4) |
+|---|---|---|
+| Generation | 66% | ~80% |
+| Running tests | 13% | 10–13% |
+| Training | 21% | ~7–9% |
+
+The shape is the same: **generation dominates**. The test share matches closely. Our
+generation share is higher because we use plain Hugging Face `generate` rather than a fast
+inference engine. Our training share is lower because LoRA on a 1.5B model is cheap to
+train.
+
+**What it means.** Training is only ~8% of the step, so simply running training in parallel
+with generation would save at most ~8%. The bigger wins are:
+
+1. **Faster generation:** a dedicated inference engine (e.g. vLLM) with continuous batching.
+2. **Overlap the idle time:** keep generating while the tests for earlier answers run.
+3. **Asynchronous training:** a separate generator that never waits for the trainer.
+
+Step 3 creates a new problem: the generator works with weights that are a few updates old.
+The importance ratio is then no longer 1, so the loop would need:
+
+- the generator's own log-probabilities as the "old policy" values,
+- per-token importance ratios (the current code uses a per-sequence average),
+- a limit on how stale the data may get,
+- a correction for short answers finishing first and being over-represented in batches.
+
+---
+
+## What broke: the learning signal ran out
+
+We checked whether answers were **cut off at the length limit** or **timing out** in the
+sandbox. Neither was the problem:
+
+| | GRPO | MicroCoder |
+|---|---|---|
+| Answers cut off at 256 tokens | 2.6% | 4.1% |
+| Answers whose tests timed out | 0% | 0.2% |
+| Average answer length (tokens) | 76 | 80 |
+
+**What we saw instead:** at several logged checkpoints, the loss was exactly 0, with a group
+reward of 1.00 (all 4 answers passed) or 0.00 (all 4 failed). When every answer gets the
+same score, every answer is exactly average, so the step teaches the model nothing. On
+problems that are too easy or too hard for the model, the learning signal disappears.
+
+The next measurement is the percentage of all 200 steps where this happened. The standard
+fix is **DAPO's dynamic sampling**: skip or resample problems where all answers scored the
+same.
+
+**About truncation masking** (MicroCoder's Fix 1): cut-off code can't run, so it scores 0.
+That teaches the model to write short answers instead of correct ones. Masking skips some of
+those penalties. It costs lost training signal, the 30% skip rate is a heuristic, and it
+doesn't recover the time already spent generating the long answer. In this run it barely
+mattered, because almost nothing was cut off.
+
+---
+
+## How to run it
+
+**The environment's unit tests (no GPU, a few seconds):**
 
 ```bash
 git clone https://github.com/sidd1196/GRPO_implementation.git
 cd GRPO_implementation
-
-# Install. The core env (and its tests) need only `datasets` — no GPU.
-pip install -e .
-
-# Prove the environment is correct, with no model and no GPU:
-pytest -q tests/        # 12 tests: verifier scoring + multi-turn rollout protocol
+pip install -e ".[dev]"
+pytest -q tests/        # 12 tests
 ```
 
-Using the environment directly:
+**The full experiment (Colab):**
+
+1. Open the notebook in Colab:
+   `https://colab.research.google.com/github/sidd1196/GRPO_implementation/blob/main/grpo_rlvr_dapo_code.ipynb`
+2. **Runtime → Change runtime type** → a GPU with bf16 support (L4, G4 or A100; not T4).
+3. Run all cells. When asked, allow Google Drive access. Results are saved to
+   `MyDrive/GRPO_implementation/results/`.
+
+What gets saved:
+
+| File | Contents |
+|---|---|
+| `base.json`, `grpo.json`, `micro.json` | accuracies, which problems passed, the code written, full training log with timings |
+| `summary.txt` | accuracy table, paired comparison, timing |
+| `timing.png` | where each step's time goes |
+| `training_curves.png` | reward, solve rate, answer length, truncation rate over training |
+
+Training takes ~6 s per step on a G4 (~20 minutes per method). Evaluation adds more,
+because it solves one problem at a time.
+
+**Using the environment directly:**
 
 ```python
 from code_rl_env import CodeEnv, TaskSpec
 
-task = TaskSpec(
-    task_id="demo/double", prompt="Return x doubled.",
-    tests=["assert f(2) == 4", "assert f(3) == 6"], entry_point="f", source="demo",
-)
+task = TaskSpec(task_id="demo/double", prompt="Return x doubled.",
+                tests=["assert f(2) == 4", "assert f(3) == 6"],
+                entry_point="f", source="demo")
 env = CodeEnv([task], max_turns=3)
 
-obs = env.reset(task)
-step = env.step("def f(x):\n    return x + 2")     # wrong -> reward < 1, not done
-print(step.reward, step.done)                       # 0.5 False
-print(step.observation.prompt_text)                 # shows the failing test, asks for a fix
-step = env.step("def f(x):\n    return x * 2")      # corrected -> reward 1.0, done
-print(step.reward, step.done, step.info["solved"])  # 1.0 True True
-```
-
-Reward composition is a swappable `Rubric` of weighted reward functions:
-
-```python
-from code_rl_env import default_rubric, dense_rubric
-# default_rubric() -> tests only
-# dense_rubric()   -> 0.8*tests + 0.1*syntax + 0.1*format(no markdown fences)
+env.reset(task)
+step = env.step("def f(x):\n    return x + 2")   # passes 1 of 2 tests
+print(step.reward, step.done)                     # 0.5 False
+step = env.step("def f(x):\n    return x * 2")    # fixed
+print(step.reward, step.done)                     # 1.0 True
 ```
 
 ---
 
-## The GRPO experiment
+## Limitations
 
-`train_grpo.py` is the GPU part — GRPO as a client of `CodeEnv`. For each step it rolls out
-`G` multi-turn trajectories on one task (a GRPO group), asks the environment for each
-trajectory's reward, group-normalises the rewards into advantages, and takes a clipped
-policy-gradient step. One loop runs two configs via `GRPOConfig`:
+- **Small scale:** 1.5B model, LoRA rank 8, 200 steps × 4 answers, one GPU.
+- **Single seed:** no error bars; small differences are noise.
+- **Small MBPP eval set:** 30 problems, so one problem = 3.3 points.
+- **No inference engine in the run:** generation uses Hugging Face `generate`. A vLLM backend
+  exists in `train_grpo.py` (with per-step weight sync) but was not used or tested here.
+- **Synchronous loop:** asynchronous training is discussed above, not implemented.
 
-- **GRPO baseline** — KL to a frozen reference, symmetric clip ε = 0.2.
-- **MicroCoder-GRPO** ([arxiv 2603.07777](https://arxiv.org/abs/2603.07777)) — three
-  code-specific fixes: no-KL + high upper clip (Fix 3), two-stage temperature (Fix 2), and
-  truncation masking (Fix 1).
+## Next steps
 
-### Fast rollouts — the actor / learner split
-
-In a from-scratch loop the slowest part by far is **generation**: each GRPO step samples `G`
-multi-turn trajectories, so a naïve loop calls `model.generate()` up to `G × max_turns` times,
-one sequence at a time, leaving the GPU mostly idle. Production RL stacks fix this by separating
-the **actor** (a fast inference engine that only samples) from the **learner** (the training
-model that takes gradient steps). This repo mirrors that split:
-
-```mermaid
-graph TB
-    subgraph Learner["GRPO trainer  (learner — your code)"]
-        POL["Policy + LoRA"]
-        LP["log-probs + advantages"]
-        LOSS["clipped PG loss + KL"]
-        OPT["AdamW step"]
-        POL --> LP --> LOSS --> OPT --> POL
-    end
-    subgraph Actor["Rollout backend  (actor — sampler only)"]
-        VLLM["vLLM engine<br/>(batched, continuous batching)"]
-    end
-    OPT -->|"① merge LoRA → sync weights (every step)"| VLLM
-    VLLM -->|"② G completions (one batched call)"| ENV
-    subgraph EnvBox["CodeEnv  (reward — no GPU)"]
-        ENV["step → Rubric → run tests"]
-    end
-    ENV -->|"③ reward + feedback"| LP
-```
-
-The trainer selects the backend with `GRPOConfig.backend`:
-
-| `backend` | What it does | Speed | Needs |
-|---|---|---|---|
-| `"vllm"` | vLLM samples all `G` trajectories with continuous batching; policy weights synced in each step | **~10×** | `vllm` installed, GPU |
-| `"hf_batched"` | one batched `model.generate()` per turn across the live trajectories | ~3–5× | GPU |
-| `"hf"` | original one-sequence-at-a-time loop (reference / debugging) | 1× | GPU |
-
-**Weight sync (the one subtlety).** The learner trains a LoRA adapter, but vLLM serves the
-*merged* model. After each optimizer step the trainer merges the adapter into the base weights
-(`merge_adapter()`), pushes them into the running vLLM engine, then unmerges so training
-continues on the adapter. This keeps the actor's samples on-policy without rebuilding the
-engine. It is the only place the two models touch — the GRPO math is unchanged, so `"vllm"`
-and `"hf"` produce the same algorithm, only at different speeds.
-
-```python
-from code_rl_env import load_mbpp, load_humaneval, default_rubric
-from train_grpo import GRPOConfig, run_grpo, evaluate
-
-train_tasks = load_mbpp(limit=150)
-cfg = GRPOConfig(microcoder=True, num_steps=200, G=4, max_turns=3,
-                 kl_coeff=0.0, epsilon_high=0.5,
-                 backend="vllm")            # "vllm" | "hf_batched" | "hf"
-log = run_grpo(policy, tokenizer, train_tasks, cfg, rubric=default_rubric())
-
-# evaluate() reports pass@1 for in-distribution (MBPP) AND transfer (HumanEval)
-evaluate(policy, tokenizer, load_humaneval(), default_rubric())["pass@1"]
-```
-
-Evaluation deliberately reports **both** held-out MBPP (in-distribution — where the policy is
-trained) and HumanEval (transfer). Reporting only the transfer number is what made an earlier
-version of this experiment look like RL *hurt*; separating the two gives an honest answer to
-"did the policy learn the trained distribution, and did it generalise?"
-
-> **Status:** the environment, verifier, rubric and rollout protocol are unit-tested and
-> green. The multi-turn GRPO training itself runs on a Colab A100 (model: Qwen2.5-Coder-1.5B
-> + LoRA, `backend="vllm"`); result tables are produced by running the driver notebook below.
-> Single seed, small model, 200 steps, coarse 3-test MBPP reward — this is a clean reference
-> implementation, not a leaderboard entry.
+1. Measure the share of zero-signal steps; add DAPO dynamic sampling.
+2. Batch the evaluation (currently one problem at a time, about half of total runtime).
+3. Per-token importance ratios, then an asynchronous generator with a staleness limit.
+4. More seeds and more steps before claiming any accuracy difference.
 
 ---
 
-## Running on Colab
+## Other files in the repo
 
-`grpo_rlvr_dapo_code.ipynb` is a **teaching driver**: open it from GitHub in Colab
-(*File → Open notebook → GitHub*), and it clones this repo, installs the package, then walks
-through each layer of the environment with explanations before training and evaluating.
+These are earlier or side projects, not part of the current run:
 
----
+| File | What it is |
+|---|---|
+| `grpo_run_results.ipynb` | The executed notebook from the run above, with all outputs |
+| `grpo_rlvr_dapo_inline_v1.ipynb` | An earlier all-in-one version of this experiment (June 2026) |
+| `grpo_implementation.ipynb` | A toy GRPO walkthrough on a sorting task |
+| `grpo_rft_code/` | A sketch of the same experiment on TRL's `GRPOTrainer`. Not run. |
+| `git_process_rewards.py` | An early exploration of step-by-step rewards over git commits. Not used. |
+| `build_driver_notebook.py` | Regenerates `grpo_rlvr_dapo_code.ipynb` |
 
-## Repository contents
-
-```
-GRPO_implementation/
-├── code_rl_env/                 # the RL environment package (no GPU needed to import/test)
-│   ├── tasks.py  sandbox.py  verifier.py  rubric.py  episode.py  environment.py
-├── tests/                       # 12 GPU-free unit tests
-├── train_grpo.py                # GRPO/MicroCoder-GRPO trainer + evaluator (env client)
-├── grpo_rlvr_dapo_code.ipynb    # teaching driver notebook (Colab)
-├── grpo_rlvr_dapo_inline_v1.ipynb  # earlier inline implementation, kept as a results record
-├── grpo_implementation.ipynb    # toy GRPO walkthrough (sorting task) — pedagogical origin
-├── git_process_rewards.py       # process-reward modeling: dense rewards over git-commit steps
-├── grpo_rft_code/               # production-stack variant (TRL GRPOTrainer + vLLM + YAML configs)
-├── build_driver_notebook.py     # regenerates the driver notebook
-├── pyproject.toml  requirements.txt
-```
-
-- **`git_process_rewards.py`** — a standalone exploration of *process supervision*: instead of a
-  single pass/fail reward, it assigns dense, intermediate rewards (syntax, diff validity,
-  incremental test passing) across a sequence of git commits modelled as an MDP.
-- **`grpo_rft_code/`** — the same experiment expressed on the production post-training stack
-  (TRL `GRPOTrainer`, PEFT LoRA, vLLM, YAML configs) rather than a hand-rolled loop. Scaffolded
-  for a config-driven "reinforcement fine-tuning" workflow.
-
----
+`pyproject.toml` is the source of truth for dependencies; the root `requirements.txt` is
+older.
 
 ## References
 
-- **GRPO** — DeepSeekMath: Pushing the Limits of Mathematical Reasoning (2024)
-- **DAPO** — an open-source LLM RL recipe (2025): dynamic sampling, decoupled clipping
-- **MicroCoder-GRPO** — code-specific GRPO fixes (arxiv 2603.07777)
-- **PPO** — Proximal Policy Optimization Algorithms (Schulman et al., 2017)
-
-## License
-
-Educational reference implementation.
+- **GRPO:** DeepSeekMath (Shao et al., 2024), [arXiv 2402.03300](https://arxiv.org/abs/2402.03300)
+- **DAPO:** dynamic sampling and decoupled clipping (2025), [arXiv 2503.14476](https://arxiv.org/abs/2503.14476)
+- **MicroCoder-GRPO:** [arXiv 2603.07777](https://arxiv.org/abs/2603.07777)
+- **RollPacker:** time breakdown of synchronous RL training, [arXiv 2509.21009](https://arxiv.org/abs/2509.21009)
+- **Qwen2.5-Coder:** [arXiv 2409.12186](https://arxiv.org/abs/2409.12186)
