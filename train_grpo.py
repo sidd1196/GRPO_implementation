@@ -11,6 +11,9 @@ Two configs share one loop:
   MicroCoder-GRPO   : no KL + high upper clip (Fix 3), two-stage temperature (Fix 2),
                       truncation masking (Fix 1). (arxiv 2603.07777)
 
+Optional for either config: `turn_cost` (a later-attempt fix scores less than a first-try
+solve) and `dynamic_sampling` (DAPO: resample tasks whose G answers all tie).
+
 Rollout backend (the actor / learner split — see README):
   "hf"          : reference loop, one sequence at a time (slow, for debugging).
   "hf_batched"  : one batched model.generate() per turn across the live trajectories (~3-5x).
@@ -64,6 +67,11 @@ class GRPOConfig:
     repeat_check_len: int = 128
     # credit: use the final-turn reward or the best across turns
     reward_mode: str = "final"         # "final" | "best"
+    turn_cost: float = 0.0             # subtracted per extra attempt: 0.1 -> 1st-try 1.0, 3rd-try 0.8
+    # DAPO dynamic sampling: if all G answers score the same (zero advantage -> no learning
+    # signal), draw a different task and retry, up to max_resample extra groups per step
+    dynamic_sampling: bool = False
+    max_resample: int = 3
     eval_every: int = 50
     seed: int = 42
     # rollout backend (actor)
@@ -359,6 +367,14 @@ def _is_repetitive(comp_ids: torch.Tensor, m: int) -> bool:
     return comp_ids[-m:].tolist() == comp_ids[-2 * m:-m].tolist()
 
 
+def _traj_reward(traj: Trajectory, cfg: GRPOConfig) -> float:
+    """One scalar per trajectory: the final (or best) attempt's score, minus a cost per extra
+    attempt. Without the cost a 3rd-try fix scores 1.0 like a 1st-try solve, so groups where
+    every answer eventually passes all tie -> zero advantage -> no learning signal."""
+    base = traj.best_reward if cfg.reward_mode == "best" else traj.final_reward
+    return base - cfg.turn_cost * (traj.n_turns - 1)
+
+
 # ── timing ───────────────────────────────────────────────────────────────────────
 def _now() -> float:
     """Wall-clock time after waiting for queued GPU work. CUDA calls return before the GPU
@@ -378,6 +394,8 @@ def timing_summary(log: Dict, skip_first: int = 1) -> Dict[str, float]:
            "gpu_idle_frac": (mean["t_env"] + mean["t_sync"]) / total if total else 0.0}
     for k in ("trunc_rate", "timeout_rate", "comp_len_mean", "comp_len_max"):
         out[k] = sum(log[k]) / len(log[k])
+    out["zero_signal_frac"] = sum(log["zero_signal"]) / len(log["zero_signal"])  # steps that taught nothing
+    out["groups_per_step"] = sum(log["groups_tried"]) / len(log["groups_tried"])  # >1 = dynamic sampling retried
     return out
 
 
@@ -407,26 +425,29 @@ def run_grpo(policy, tokenizer, train_tasks: List[TaskSpec], cfg: GRPOConfig,
                            "eval_steps", "eval_accs",
                            # timing / "what broke" diagnostics, one entry per step
                            "t_gen", "t_env", "t_train", "t_sync",
-                           "trunc_rate", "timeout_rate", "comp_len_mean", "comp_len_max")}
+                           "trunc_rate", "timeout_rate", "comp_len_mean", "comp_len_max",
+                           "zero_signal", "groups_tried")}
 
     for step in tqdm(range(cfg.num_steps), desc=f"{mode} training"):
-        task = rng.choice(train_tasks)
-
         # Fix 2: two-stage temperature (MicroCoder only)
         if cfg.microcoder:
             temperature = cfg.temp_stage2 if step >= cfg.temp_switch_step else cfg.temp_stage1
         else:
             temperature = cfg.temperature
 
+        # Roll out a group; with dynamic sampling, retry on a new task while the group ties.
+        # Discarded groups still cost generation + test time, and it stays in t_gen / t_env.
         timings = {"t_gen": 0.0, "t_env": 0.0}
-        trajs, tokens = rollout_group(gen_fn, task, rubric, cfg, temperature, rng, timings)
+        n_tries = 1 + (cfg.max_resample if cfg.dynamic_sampling else 0)
+        for groups_tried in range(1, n_tries + 1):
+            task = rng.choice(train_tasks)
+            trajs, tokens = rollout_group(gen_fn, task, rubric, cfg, temperature, rng, timings)
+            rewards = torch.tensor([_traj_reward(t, cfg) for t in trajs], device=device)
+            if rewards.std() > 1e-6:
+                break
         t_train0 = _now()
 
-        # reward per trajectory -> group-normalised advantage
-        if cfg.reward_mode == "best":
-            rewards = torch.tensor([t.best_reward for t in trajs], device=device)
-        else:
-            rewards = torch.tensor([t.final_reward for t in trajs], device=device)
+        # reward per trajectory -> group-normalised advantage (all-tied group: no signal)
         if rewards.std() > 1e-6:
             advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         else:
@@ -486,6 +507,8 @@ def run_grpo(policy, tokenizer, train_tasks: List[TaskSpec], cfg: GRPOConfig,
                                    / len(all_turns))
         log["comp_len_mean"].append(sum(comp_lens) / len(comp_lens))
         log["comp_len_max"].append(max(comp_lens))
+        log["zero_signal"].append(bool(rewards.std() <= 1e-6))
+        log["groups_tried"].append(groups_tried)
 
         log["steps"].append(step)
         log["losses"].append(loss.item())

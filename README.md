@@ -87,9 +87,14 @@ MicroCoder-GRPO comes from [arXiv 2603.07777](https://arxiv.org/abs/2603.07777).
 
 **An honest caveat:** in this run, two of MicroCoder's three fixes had almost no effect.
 
-- **The larger upper clip never applies.** The loop is synchronous and on-policy, so the
-  importance ratio (new policy ÷ policy that generated the data) is always exactly 1. A clip
-  on a ratio that is always 1 does nothing.
+- **The larger upper clip never applies.** The "old" log-probs come from the same forward
+  pass as the new ones, detached, not from the generator. So the importance ratio is exactly
+  1 by construction, and a clip on it does nothing. With one gradient step per batch this is
+  fine in practice. But measured properly, the ratio wouldn't be exactly 1 even here: answers
+  are sampled at temperature 0.8 (GRPO; MicroCoder uses 0.7, then 1.0) while log-probs are
+  scored at temperature 1, and batched KV-cache generation and a single full forward pass
+  don't produce bit-identical log-probs. A real "old policy" should be the generator's own
+  log-probs, at the sampling temperature.
 - **Truncation masking rarely triggers.** Only ~3–4% of answers hit the 256-token limit.
 
 So the real difference between the two runs is **temperature schedule + KL on/off**.
@@ -204,9 +209,18 @@ reward of 1.00 (all 4 answers passed) or 0.00 (all 4 failed). When every answer 
 same score, every answer is exactly average, so the step teaches the model nothing. On
 problems that are too easy or too hard for the model, the learning signal disappears.
 
-The next measurement is the percentage of all 200 steps where this happened. The standard
-fix is **DAPO's dynamic sampling**: skip or resample problems where all answers scored the
-same.
+**How often:** in **[X]%** of GRPO steps and **[Y]%** of MicroCoder steps, all 4 answers got
+the same score (group reward std = 0), so the step produced no learning signal.
+
+**Why it's this high — partly by design.** Each answer gets up to 3 attempts, and there is
+no penalty for using them: a fix on attempt 3 scores 1.0, exactly like a first-try solve.
+The base model already solves about two-thirds of the problems, so with three attempts most
+answers reach 1.0 and the whole group ties. Multi-turn without a turn cost creates
+zero-signal groups.
+
+**Fixes:** (1) a small per-turn cost, so a first-try solve beats a third-try solve;
+(2) DAPO's dynamic sampling: skip or resample problems where all answers scored the same;
+(3) harder training problems.
 
 **About truncation masking** (MicroCoder's Fix 1): cut-off code can't run, so it scores 0.
 That teaches the model to write short answers instead of correct ones. Masking skips some of
@@ -274,10 +288,11 @@ print(step.reward, step.done)                     # 1.0 True
 - **No inference engine in the run:** generation uses Hugging Face `generate`. A vLLM backend
   exists in `train_grpo.py` (with per-step weight sync) but was not used or tested here.
 - **Synchronous loop:** asynchronous training is discussed above, not implemented.
+- **No turn cost:** a third-try solve is rewarded the same as a first-try solve.
 
 ## Next steps
 
-1. Measure the share of zero-signal steps; add DAPO dynamic sampling.
+1. Add a per-turn cost and DAPO dynamic sampling; rerun and compare the zero-signal share.
 2. Batch the evaluation (currently one problem at a time, about half of total runtime).
 3. Per-token importance ratios, then an asynchronous generator with a staleness limit.
 4. More seeds and more steps before claiming any accuracy difference.

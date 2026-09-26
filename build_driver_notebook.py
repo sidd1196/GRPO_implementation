@@ -210,6 +210,18 @@ the policy, there is no weight sync — but sampling and training still run one 
 so the loop is synchronous and on-policy. `run_grpo` logs per-step generation / sandbox /
 training / sync time; `timing_summary(log)` reports the breakdown. (`backend="vllm"` — a separate
 sampler engine with per-step weight sync — is still in `train_grpo.py` but not used here.)
+
+**Two fixes for zero-signal steps (both runs).** When all `G` answers get the same score, every
+advantage is 0 and the step teaches nothing. With 3 attempts and no penalty for using them,
+this happened often: a 3rd-try fix scored 1.0, like a 1st-try solve. So both runs now use:
+
+- `turn_cost=0.1` — each extra attempt costs 0.1 (1st try 1.0, 2nd 0.9, 3rd 0.8), which
+  breaks the all-1.0 ties.
+- `dynamic_sampling=True` (from DAPO) — if the group still ties, draw a different problem and
+  retry, up to 3 extra groups. Retries cost generation time, which is counted in `t_gen`.
+
+`zero_signal_frac` (share of steps with no learning signal) and `groups_per_step` (how many
+groups each step needed) are printed with the timing.
 """))
 
 cells.append(code(r"""
@@ -240,21 +252,6 @@ def fresh_policy():
     return get_peft_model(m, lora)
 
 print(f"train={len(train_tasks)}  eval_mbpp={len(eval_mbpp)}  humaneval={len(humaneval)}")
-
-# Results go to Google Drive: Colab's own disk is wiped when the runtime disconnects.
-import json, os
-from google.colab import drive
-drive.mount("/content/drive")
-RESULTS_DIR = "/content/drive/MyDrive/GRPO_implementation/results"
-os.makedirs(RESULTS_DIR, exist_ok=True)
-
-# Write one run's training log, timing summary and full eval results (incl. which
-# problems passed) to RESULTS_DIR/<name>.json — called right after each run.
-def save_results(name, log=None, **evals):
-    out = {"log": log, "timing": timing_summary(log) if log else None, "evals": evals}
-    with open(f"{RESULTS_DIR}/{name}.json", "w") as f:
-        json.dump(out, f, indent=1)
-    print("saved", f"{RESULTS_DIR}/{name}.json")
 """))
 
 cells.append(md(r"""
@@ -271,7 +268,6 @@ base_mbpp_res = evaluate(base, tokenizer, eval_mbpp, rubric)
 base_he_res   = evaluate(base, tokenizer, humaneval, rubric)
 base_mbpp, base_he = base_mbpp_res["pass@1"], base_he_res["pass@1"]
 print(f"BASE   MBPP(in-dist)={base_mbpp:.3f}   HumanEval(transfer)={base_he:.3f}")
-save_results("base", mbpp=base_mbpp_res, humaneval=base_he_res)
 del base; torch.cuda.empty_cache()
 """))
 
@@ -285,6 +281,8 @@ for p in ref.parameters():
 
 grpo_cfg = GRPOConfig(microcoder=False, num_steps=200, G=4, max_turns=3,
                       kl_coeff=0.01, epsilon_low=0.2, epsilon_high=0.2, temperature=0.8,
+                      turn_cost=0.1,             # 1st-try solve 1.0, 2nd 0.9, 3rd 0.8
+                      dynamic_sampling=True, max_resample=3,   # retry tied groups (DAPO)
                       backend="hf_batched")      # one batched model.generate() per turn
 grpo_log = run_grpo(policy, tokenizer, train_tasks, grpo_cfg,
                     ref_model=ref, rubric=rubric, eval_tasks=eval_mbpp)
@@ -295,7 +293,6 @@ grpo_mbpp, grpo_he = grpo_mbpp_res["pass@1"], grpo_he_res["pass@1"]
 print(f"GRPO   MBPP(in-dist)={grpo_mbpp:.3f}   HumanEval(transfer)={grpo_he:.3f}")
 for k, v in timing_summary(grpo_log).items():
     print(f"  {k:15s} {v:.3f}")
-save_results("grpo", grpo_log, mbpp=grpo_mbpp_res, humaneval=grpo_he_res)
 del policy, ref; torch.cuda.empty_cache()
 """))
 
@@ -307,6 +304,7 @@ mc_cfg = GRPOConfig(microcoder=True, num_steps=200, G=4, max_turns=3,
                     kl_coeff=0.0, epsilon_low=0.2, epsilon_high=0.5,
                     temp_stage1=0.7, temp_stage2=1.0, temp_switch_step=100,
                     mask_prob=0.3, repeat_check_len=128,
+                    turn_cost=0.1, dynamic_sampling=True, max_resample=3,
                     backend="hf_batched")
 mc_log = run_grpo(mc_policy, tokenizer, train_tasks, mc_cfg,
                   ref_model=None, rubric=rubric, eval_tasks=eval_mbpp)
@@ -317,7 +315,6 @@ mc_mbpp, mc_he = mc_mbpp_res["pass@1"], mc_he_res["pass@1"]
 print(f"MicroCoder-GRPO   MBPP(in-dist)={mc_mbpp:.3f}   HumanEval(transfer)={mc_he:.3f}")
 for k, v in timing_summary(mc_log).items():
     print(f"  {k:15s} {v:.3f}")
-save_results("micro", mc_log, mbpp=mc_mbpp_res, humaneval=mc_he_res)
 """))
 
 cells.append(md("## 7 · Results — in-distribution vs transfer"))
@@ -339,14 +336,11 @@ for split, g_res, m_res in [("MBPP", grpo_mbpp_res, mc_mbpp_res),
     lines.append(f"{split:<10} only GRPO solved {len(g - m):>3} | only MicroCoder solved {len(m - g):>3}")
 print("\n" + "\n".join(lines))
 
-with open(f"{RESULTS_DIR}/summary.txt", "w") as f:
-    for name, m, h in [("Base", base_mbpp, base_he), ("GRPO", grpo_mbpp, grpo_he),
-                       ("MicroCoder-GRPO", mc_mbpp, mc_he)]:
-        f.write(f"{name:<20} MBPP={m:.3f}  HumanEval={h:.3f}\n")
-    f.write("\n" + "\n".join(lines) + "\n\nTiming (mean s/step):\n")
-    for name, log in [("GRPO", grpo_log), ("MicroCoder", mc_log)]:
-        f.write(f"{name}: " + "  ".join(f"{k}={v:.3f}" for k, v in timing_summary(log).items()) + "\n")
-print("saved", f"{RESULTS_DIR}/summary.txt")
+# Timing and training diagnostics, side by side
+tg, tm = timing_summary(grpo_log), timing_summary(mc_log)
+print(f"\n{'':18s}{'GRPO':>10s}{'MicroCoder':>12s}")
+for k in tg:
+    print(f"{k:18s}{tg[k]:>10.3f}{tm[k]:>12.3f}")
 """))
 
 cells.append(code(r"""
@@ -365,7 +359,7 @@ for ax, (key, title) in zip(axes.flat, curves):
     ax.plot(smooth(grpo_log[key]), label="GRPO")
     ax.plot(smooth(mc_log[key]), label="MicroCoder")
     ax.set_title(f"{title}  (10-step avg)"); ax.set_xlabel("step"); ax.legend()
-plt.tight_layout(); plt.savefig(f"{RESULTS_DIR}/training_curves.png", dpi=150); plt.show()
+plt.tight_layout(); plt.show()
 
 # Where does each step's time go? Phases run one after another — nothing overlaps.
 phases = [("t_gen", "generate (GPU busy)"), ("t_env", "run tests (GPU idle)"),
@@ -381,7 +375,7 @@ for key, label in phases:
     left = [l + v for l, v in zip(left, vals)]
 ax.set_xlabel("seconds per training step (mean)")
 ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.3), ncol=3, frameon=False)
-plt.tight_layout(); plt.savefig(f"{RESULTS_DIR}/timing.png", dpi=150); plt.show()
+plt.tight_layout(); plt.show()
 """))
 
 cells.append(md(r"""
@@ -389,11 +383,13 @@ cells.append(md(r"""
 
 For problems where GRPO and MicroCoder-GRPO **disagree** (one passed, the other failed), print
 the task, then the base / GRPO / MicroCoder code side by side, with the first failing test and
-its error. Reads the saved results from Drive, so after a restart just re-run the setup cells.
+its error. Uses the results from the runs above (nothing is saved to disk).
 """))
 
 cells.append(code(r"""
-res = {n: json.load(open(f"{RESULTS_DIR}/{n}.json"))["evals"] for n in ("base", "grpo", "micro")}
+res = {"base":  {"mbpp": base_mbpp_res, "humaneval": base_he_res},
+       "grpo":  {"mbpp": grpo_mbpp_res, "humaneval": grpo_he_res},
+       "micro": {"mbpp": mc_mbpp_res,   "humaneval": mc_he_res}}
 tasks_by_id = {t.task_id: t for t in eval_mbpp + humaneval}
 
 def show_example(split, task_id):
@@ -428,9 +424,8 @@ cells.append(md(r"""
   another. Any algorithm can consume the same `reset()/step()` surface.
 - **Verifiable & testable** — the reward source is unit-tested without a GPU (Section 5). The
   environment's correctness is established independently of training.
-- **Multi-turn** — write → run tests → read the traceback → revise. The `mean turns to
-  terminate` curve shows how often the model needs a second attempt, and whether training
-  teaches it to self-correct.
+- **Multi-turn** — write → run tests → read the traceback → revise, with a small cost per
+  extra attempt so a first-try solve is worth more than a third-try fix.
 - **Honest measurement** — reporting in-distribution (MBPP) *and* transfer (HumanEval)
   separates "did RL learn the trained distribution?" from "did it generalise?". The single
   transfer number alone is what made the original result look like pure regression.
@@ -439,7 +434,8 @@ cells.append(md(r"""
 seed. The point of this notebook is the *environment abstraction and the honest evaluation*,
 not a leaderboard number.
 
-**Natural next steps:** DAPO-style dynamic sampling (resample zero-variance groups), a denser
+**Natural next steps:** batched evaluation, per-token importance ratios with the generator's
+own log-probs, an asynchronous generator with a staleness limit, a denser
 rubric (`dense_rubric()` is ready), a tool-use turn (let the model call the interpreter
 itself), and wrapping `CodeEnv` in a thin `verifiers`-compatible adapter.
 """))
