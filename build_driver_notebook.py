@@ -240,6 +240,21 @@ def fresh_policy():
     return get_peft_model(m, lora)
 
 print(f"train={len(train_tasks)}  eval_mbpp={len(eval_mbpp)}  humaneval={len(humaneval)}")
+
+# Results go to Google Drive: Colab's own disk is wiped when the runtime disconnects.
+import json, os
+from google.colab import drive
+drive.mount("/content/drive")
+RESULTS_DIR = "/content/drive/MyDrive/GRPO_implementation/results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# Write one run's training log, timing summary and full eval results (incl. which
+# problems passed) to RESULTS_DIR/<name>.json — called right after each run.
+def save_results(name, log=None, **evals):
+    out = {"log": log, "timing": timing_summary(log) if log else None, "evals": evals}
+    with open(f"{RESULTS_DIR}/{name}.json", "w") as f:
+        json.dump(out, f, indent=1)
+    print("saved", f"{RESULTS_DIR}/{name}.json")
 """))
 
 cells.append(md(r"""
@@ -252,9 +267,11 @@ We now also measure held-out MBPP (in-distribution) — where RL is trained — 
 
 cells.append(code(r"""
 base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=dtype, device_map="auto")
-base_mbpp = evaluate(base, tokenizer, eval_mbpp, rubric)["pass@1"]
-base_he   = evaluate(base, tokenizer, humaneval, rubric)["pass@1"]
+base_mbpp_res = evaluate(base, tokenizer, eval_mbpp, rubric)
+base_he_res   = evaluate(base, tokenizer, humaneval, rubric)
+base_mbpp, base_he = base_mbpp_res["pass@1"], base_he_res["pass@1"]
 print(f"BASE   MBPP(in-dist)={base_mbpp:.3f}   HumanEval(transfer)={base_he:.3f}")
+save_results("base", mbpp=base_mbpp_res, humaneval=base_he_res)
 del base; torch.cuda.empty_cache()
 """))
 
@@ -272,11 +289,13 @@ grpo_cfg = GRPOConfig(microcoder=False, num_steps=200, G=4, max_turns=3,
 grpo_log = run_grpo(policy, tokenizer, train_tasks, grpo_cfg,
                     ref_model=ref, rubric=rubric, eval_tasks=eval_mbpp)
 
-grpo_mbpp = evaluate(policy, tokenizer, eval_mbpp, rubric)["pass@1"]
-grpo_he   = evaluate(policy, tokenizer, humaneval, rubric)["pass@1"]
+grpo_mbpp_res = evaluate(policy, tokenizer, eval_mbpp, rubric)
+grpo_he_res   = evaluate(policy, tokenizer, humaneval, rubric)
+grpo_mbpp, grpo_he = grpo_mbpp_res["pass@1"], grpo_he_res["pass@1"]
 print(f"GRPO   MBPP(in-dist)={grpo_mbpp:.3f}   HumanEval(transfer)={grpo_he:.3f}")
 for k, v in timing_summary(grpo_log).items():
     print(f"  {k:15s} {v:.3f}")
+save_results("grpo", grpo_log, mbpp=grpo_mbpp_res, humaneval=grpo_he_res)
 del policy, ref; torch.cuda.empty_cache()
 """))
 
@@ -292,11 +311,13 @@ mc_cfg = GRPOConfig(microcoder=True, num_steps=200, G=4, max_turns=3,
 mc_log = run_grpo(mc_policy, tokenizer, train_tasks, mc_cfg,
                   ref_model=None, rubric=rubric, eval_tasks=eval_mbpp)
 
-mc_mbpp = evaluate(mc_policy, tokenizer, eval_mbpp, rubric)["pass@1"]
-mc_he   = evaluate(mc_policy, tokenizer, humaneval, rubric)["pass@1"]
+mc_mbpp_res = evaluate(mc_policy, tokenizer, eval_mbpp, rubric)
+mc_he_res   = evaluate(mc_policy, tokenizer, humaneval, rubric)
+mc_mbpp, mc_he = mc_mbpp_res["pass@1"], mc_he_res["pass@1"]
 print(f"MicroCoder-GRPO   MBPP(in-dist)={mc_mbpp:.3f}   HumanEval(transfer)={mc_he:.3f}")
 for k, v in timing_summary(mc_log).items():
     print(f"  {k:15s} {v:.3f}")
+save_results("micro", mc_log, mbpp=mc_mbpp_res, humaneval=mc_he_res)
 """))
 
 cells.append(md("## 7 · Results — in-distribution vs transfer"))
@@ -308,24 +329,94 @@ for name, m, h in [("Base", base_mbpp, base_he),
                    ("GRPO", grpo_mbpp, grpo_he),
                    ("MicroCoder-GRPO", mc_mbpp, mc_he)]:
     print(f"{name:<20}{m:>16.3f}{h:>22.3f}")
+
+# Paired: pass@1 differences are within noise on 30 problems, so look at the problems
+# where the two methods DISAGREE — that is the sharper comparison.
+lines = []
+for split, g_res, m_res in [("MBPP", grpo_mbpp_res, mc_mbpp_res),
+                            ("HumanEval", grpo_he_res, mc_he_res)]:
+    g, m = set(g_res["passed"]), set(m_res["passed"])
+    lines.append(f"{split:<10} only GRPO solved {len(g - m):>3} | only MicroCoder solved {len(m - g):>3}")
+print("\n" + "\n".join(lines))
+
+with open(f"{RESULTS_DIR}/summary.txt", "w") as f:
+    for name, m, h in [("Base", base_mbpp, base_he), ("GRPO", grpo_mbpp, grpo_he),
+                       ("MicroCoder-GRPO", mc_mbpp, mc_he)]:
+        f.write(f"{name:<20} MBPP={m:.3f}  HumanEval={h:.3f}\n")
+    f.write("\n" + "\n".join(lines) + "\n\nTiming (mean s/step):\n")
+    for name, log in [("GRPO", grpo_log), ("MicroCoder", mc_log)]:
+        f.write(f"{name}: " + "  ".join(f"{k}={v:.3f}" for k, v in timing_summary(log).items()) + "\n")
+print("saved", f"{RESULTS_DIR}/summary.txt")
 """))
 
 cells.append(code(r"""
 import matplotlib.pyplot as plt
 
-fig, ax = plt.subplots(1, 3, figsize=(16, 4))
-ax[0].plot(grpo_log["rewards"], label="GRPO", alpha=.8)
-ax[0].plot(mc_log["rewards"], label="MicroCoder", alpha=.8)
-ax[0].set_title("mean group reward"); ax[0].set_xlabel("step"); ax[0].legend()
+# Each step trains on ONE problem, so raw per-step curves are very noisy: plot a moving average.
+def smooth(xs, w=10):
+    return [sum(xs[max(0, i - w + 1):i + 1]) / len(xs[max(0, i - w + 1):i + 1]) for i in range(len(xs))]
 
-ax[1].plot(grpo_log["solve_rate"], label="GRPO", alpha=.8)
-ax[1].plot(mc_log["solve_rate"], label="MicroCoder", alpha=.8)
-ax[1].set_title("group solve rate (any turn)"); ax[1].set_xlabel("step"); ax[1].legend()
+curves = [("rewards",       "mean group reward"),
+          ("solve_rate",    "group solve rate (all tests passed)"),
+          ("comp_len_mean", "mean answer length (tokens)"),
+          ("trunc_rate",    "share of answers cut off at the token limit")]
+fig, axes = plt.subplots(2, 2, figsize=(12, 7))
+for ax, (key, title) in zip(axes.flat, curves):
+    ax.plot(smooth(grpo_log[key]), label="GRPO")
+    ax.plot(smooth(mc_log[key]), label="MicroCoder")
+    ax.set_title(f"{title}  (10-step avg)"); ax.set_xlabel("step"); ax.legend()
+plt.tight_layout(); plt.savefig(f"{RESULTS_DIR}/training_curves.png", dpi=150); plt.show()
 
-ax[2].plot(grpo_log["mean_turns"], label="GRPO", alpha=.8)
-ax[2].plot(mc_log["mean_turns"], label="MicroCoder", alpha=.8)
-ax[2].set_title("mean turns to terminate"); ax[2].set_xlabel("step"); ax[2].legend()
-plt.tight_layout(); plt.show()
+# Where does each step's time go? Phases run one after another — nothing overlaps.
+phases = [("t_gen", "generate (GPU busy)"), ("t_env", "run tests (GPU idle)"),
+          ("t_train", "train (GPU busy)"), ("t_sync", "weight sync (GPU idle)")]
+tg, tm = timing_summary(grpo_log), timing_summary(mc_log)
+fig, ax = plt.subplots(figsize=(8, 2.8))
+left = [0.0, 0.0]
+for key, label in phases:
+    vals = [tg[key], tm[key]]
+    if max(vals) == 0:                       # e.g. no weight sync with hf_batched
+        continue
+    ax.barh(["GRPO", "MicroCoder"], vals, left=left, label=label)
+    left = [l + v for l, v in zip(left, vals)]
+ax.set_xlabel("seconds per training step (mean)")
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.3), ncol=3, frameon=False)
+plt.tight_layout(); plt.savefig(f"{RESULTS_DIR}/timing.png", dpi=150); plt.show()
+"""))
+
+cells.append(md(r"""
+### 7b · Examples — the code each model actually wrote
+
+For problems where GRPO and MicroCoder-GRPO **disagree** (one passed, the other failed), print
+the task, then the base / GRPO / MicroCoder code side by side, with the first failing test and
+its error. Reads the saved results from Drive, so after a restart just re-run the setup cells.
+"""))
+
+cells.append(code(r"""
+res = {n: json.load(open(f"{RESULTS_DIR}/{n}.json"))["evals"] for n in ("base", "grpo", "micro")}
+tasks_by_id = {t.task_id: t for t in eval_mbpp + humaneval}
+
+def show_example(split, task_id):
+    t = tasks_by_id[task_id]
+    print("=" * 80 + f"\n{split} | {task_id}\n\nTASK:\n{t.prompt.strip()}\n")
+    for name in ("base", "grpo", "micro"):
+        r = next(x for x in res[name][split]["results"] if x["task_id"] == task_id)
+        print(f"--- {name.upper()}  {'✅ passed' if r['passed'] else '❌ failed'}")
+        print(r["completion"].strip())
+        if not r["passed"]:
+            _, vr, _ = rubric.score(r["completion"], t)   # re-run the tests to show why it failed
+            print("\n" + vr.feedback())
+        print()
+
+N_EXAMPLES = 3
+for split in ("mbpp", "humaneval"):
+    grpo_ok  = set(res["grpo"][split]["passed"])
+    micro_ok = set(res["micro"][split]["passed"])
+    disagree = sorted(micro_ok - grpo_ok) + sorted(grpo_ok - micro_ok)   # Micro wins listed first
+    print(f"\n##### {split}: {len(disagree)} problems where GRPO and MicroCoder disagree")
+    # if they agree everywhere, still show one problem so there is code on screen
+    for tid in (disagree or [res["micro"][split]["results"][0]["task_id"]])[:N_EXAMPLES]:
+        show_example(split, tid)
 """))
 
 cells.append(md(r"""
