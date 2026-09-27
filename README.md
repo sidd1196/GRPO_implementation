@@ -25,6 +25,24 @@ It has three parts:
 - **RL did not meaningfully improve accuracy at this scale.** The run is small (800
   rollouts in total), so the accuracy differences are within noise. The honest findings are
   about **how the loop behaves**, not about a better model. Details below.
+- **Run 2 completed (Sept 26, G4):** both methods re-run with a turn cost and DAPO dynamic
+  sampling. Zero-signal steps fell to 6–7%, generation per step nearly doubled, accuracy
+  did not change, and the earlier MicroCoder advantage did not replicate. See
+  [Run 2](#run-2-turn-cost--dynamic-sampling).
+
+**Open items (to do next):**
+
+1. **Re-grade HumanEval with the prompt's imports.** Some Run 2 failures look like dropped
+   `from typing import List` lines rather than wrong code (see Run 2). The notebook no longer
+   saves results, so this needs a new Colab session: add the check cell from the Run 2
+   section after the MicroCoder cell and re-run the notebook.
+2. **Fill in [X]/[Y]** in "What broke" (Run 1 zero-signal share). Run 1's `grpo.json` /
+   `micro.json` are still on Google Drive under `GRPO_implementation/results/`.
+3. **Update stale parts of this README** once the numbers are final:
+   - "How to run it" still describes saving to Drive; the notebook now only prints.
+   - `grpo_run_results.ipynb` (Run 1's executed notebook) is not in the repo.
+   - "Next steps" item 1 (turn cost + dynamic sampling) is done.
+4. **Commit the executed Run 2 notebook** so its printed results show on GitHub.
 
 ---
 
@@ -227,6 +245,84 @@ That teaches the model to write short answers instead of correct ones. Masking s
 those penalties. It costs lost training signal, the 30% skip rate is a heuristic, and it
 doesn't recover the time already spent generating the long answer. In this run it barely
 mattered, because almost nothing was cut off.
+
+---
+
+## Run 2: turn cost + dynamic sampling
+
+Same setup as Run 1 (G4 GPU, 200 steps, 4 answers per problem, up to 3 attempts, single
+seed), with two changes applied to **both** methods:
+
+- `turn_cost=0.1`: each extra attempt costs 0.1 (1st try 1.0, 2nd 0.9, 3rd 0.8).
+- `dynamic_sampling=True`: if all 4 answers still tie, draw a different problem and retry,
+  up to 4 groups per step.
+
+**Accuracy**
+
+| | MBPP (30) | HumanEval (164) |
+|---|---|---|
+| Base | 0.667 | 0.567 (93) |
+| GRPO, Run 1 | 0.700 | 0.537 (88) |
+| GRPO, Run 2 | 0.667 | 0.537 (88) |
+| MicroCoder, Run 1 | 0.667 | 0.561 (92) |
+| MicroCoder, Run 2 | 0.667 | 0.543 (89) |
+
+Paired HumanEval (only GRPO solved / only MicroCoder solved): Run 1 **1 / 5**, Run 2
+**3 / 4**. MBPP: no disagreements in Run 2.
+
+**Learning signal and cost**
+
+| | GRPO | MicroCoder |
+|---|---|---|
+| Steps with no learning signal (`zero_signal_frac`) | 6% | 7% |
+| Groups needed per step (`groups_per_step`) | 1.9 | 1.9 |
+| Generate per step (Run 1 → Run 2) | 4.7 s → 8.8 s | 4.9 s → 9.0 s |
+| Total per step (Run 1 → Run 2) | 5.8 s → 10.4 s | 6.1 s → 10.7 s |
+| Answers cut off at 256 tokens | 3.4% | 4.9% |
+
+**What it shows**
+
+- **The fixes did what they target.** Only 6–7% of steps ended with no signal. With up to 4
+  tries, a fraction *p* of tied groups leaves *p*⁴ zero-signal steps, so 0.06–0.07 means
+  **about half of all groups still tied on the first try**, even with the turn cost.
+- **It cost generation.** ~1.9 groups per step nearly doubled generation time for the same
+  200 updates. Generation was already ~80% of each step.
+- **Accuracy didn't move.** The mid-training MBPP evaluation stayed at 0.667–0.700 in both
+  methods. More signal per step didn't help, so the limit is likely the update size
+  (learning rate 1e-5, LoRA rank 8, 200 steps), not the signal.
+- **The Run 1 MicroCoder advantage did not replicate** (5-vs-1 became 4-vs-3). At this scale
+  there is no measurable difference between the two methods.
+
+**Pending check: missing imports in HumanEval.** In the printed examples, 2 of the 3 GRPO
+failures shown are not wrong logic: GRPO left out `from typing import List` and failed with
+`NameError: name 'List' is not defined`, while the base model and MicroCoder kept the import.
+HumanEval prompts contain the imports, and the standard HumanEval harness runs
+**prompt + completion**, so the import is always present. This repo runs the model's code on
+its own, so a dropped import counts as a failure. Training on MBPP, which rarely needs
+imports, may teach the model to drop them. **This is a hypothesis from 2 examples**; if it
+holds, part of the HumanEval drop in both runs is a grading artifact, not worse code.
+
+To check it, add this cell after the MicroCoder cell and re-run the notebook:
+
+```python
+def pass_with_prompt_imports(res, tasks):
+    # re-grade with the prompt's own import lines added, as the standard HumanEval harness does
+    by_id = {t.task_id: t for t in tasks}
+    ok = 0
+    for r in res["results"]:
+        t = by_id[r["task_id"]]
+        imports = "\n".join(l for l in t.prompt.splitlines() if l.startswith(("import ", "from ")))
+        _, vr, _ = rubric.score(imports + "\n" + r["completion"], t)
+        ok += vr.all_passed
+    return ok / len(res["results"])
+
+for name, r in [("Base", base_he_res), ("GRPO", grpo_he_res), ("MicroCoder", mc_he_res)]:
+    print(f"{name:12s} HumanEval as graded: {r['pass@1']:.3f}   "
+          f"with prompt imports: {pass_with_prompt_imports(r, humaneval):.3f}")
+```
+
+If the gap between the base model and GRPO shrinks with the imports added, the hypothesis
+holds.
 
 ---
 
